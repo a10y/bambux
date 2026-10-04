@@ -1,0 +1,36 @@
+[package]
+name = "bambux"
+version = "0.2.0"
+edition = "2024"
+description = "A native GPUI studio and live MQTT monitor for Bambu Lab printers"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+directories = "6"
+futures = "0.3"
+gpui = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6", features = ["wayland", "x11", "font-kit", "runtime_shaders"] }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
+roxmltree = "0.21"
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
+rustls = "0.22"
+# suppaftp's rustls backend is on 0.23; rumqttc still pins 0.22.
+rustls-ftps = { package = "rustls", version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "net"] }
+toml = "0.8"
+suppaftp = { version = "12.1", features = ["rustls-ring", "deprecated"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "7", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2
