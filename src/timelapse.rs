@@ -100,9 +100,14 @@ impl TimelapsePlayer {
 
     /// Jump to a fraction (0..=1) of the video.
     pub fn seek_fraction(&self, fraction: f32) {
-        let _ = self.commands.send(PlayerCommand::Seek(
-            fraction.clamp(0.0, 1.0) * self.info.duration,
-        ));
+        let position = fraction.clamp(0.0, 1.0) * self.info.duration;
+        // Move the playhead now so the scrub knob tracks the pointer while the
+        // decoder catches up with the frame.
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.position = position;
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        let _ = self.commands.send(PlayerCommand::Seek(position));
     }
 }
 
@@ -136,7 +141,7 @@ impl Decoder {
         let mut playing = false;
         let mut next_due = Instant::now();
         loop {
-            let command = if playing {
+            let first = if playing {
                 match commands.try_recv() {
                     Ok(command) => Some(command),
                     Err(mpsc::TryRecvError::Empty) => None,
@@ -148,22 +153,30 @@ impl Decoder {
                     Err(_) => return,
                 }
             };
-            match command {
-                Some(PlayerCommand::Play) => {
-                    if self.stream.is_none() {
-                        self.restart(0.0);
+            // Dragging the scrub bar queues a seek per mouse move, and each one
+            // restarts ffmpeg. Drain the backlog and only honour the latest seek.
+            let mut seek = None;
+            let mut pending = first
+                .into_iter()
+                .chain(std::iter::from_fn(|| commands.try_recv().ok()));
+            for command in pending.by_ref() {
+                match command {
+                    PlayerCommand::Play => {
+                        if self.stream.is_none() && seek.is_none() {
+                            self.restart(0.0);
+                        }
+                        playing = true;
+                        next_due = Instant::now();
                     }
-                    playing = true;
-                    next_due = Instant::now();
+                    PlayerCommand::Pause => playing = false,
+                    PlayerCommand::Seek(position) => seek = Some(position),
                 }
-                Some(PlayerCommand::Pause) => playing = false,
-                Some(PlayerCommand::Seek(position)) => {
-                    self.restart(position);
-                    // Show the target frame immediately, even while paused.
-                    self.advance();
-                    next_due = Instant::now() + frame_interval;
-                }
-                None => {}
+            }
+            if let Some(position) = seek {
+                self.restart(position);
+                // Show the target frame immediately, even while paused.
+                self.advance();
+                next_due = Instant::now() + frame_interval;
             }
             if playing {
                 let now = Instant::now();
