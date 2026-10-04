@@ -1,4 +1,7 @@
-use std::{collections::HashMap, io::Read};
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader, Read},
+};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
@@ -7,12 +10,21 @@ const MAX_MODEL_XML_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_TRIANGLES: usize = 2_000_000;
 const MAX_RENDER_TRIANGLES: usize = 12_000;
 const MAX_RECURSION: usize = 16;
+/// Toolpath segments kept for drawing; whole layers are dropped to stay under this.
+const MAX_RENDER_SEGMENTS: usize = 40_000;
+/// Consecutive extrusion moves are merged until they span at least this many millimetres.
+const MIN_SEGMENT_MM: f32 = 0.4;
+/// Arcs are flattened into chords of roughly this length.
+const ARC_CHORD_MM: f32 = 1.0;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ModelMesh {
     pub name: String,
     pub triangles: Vec<Triangle>,
+    /// Extrusion paths from sliced G-code, used when the 3MF carries no mesh
+    /// (Bambu `.gcode.3mf` exports strip the geometry).
+    pub toolpaths: Vec<Segment>,
     pub min: [f32; 3],
     pub max: [f32; 3],
     pub source_triangles: usize,
@@ -20,6 +32,8 @@ pub struct ModelMesh {
 
 #[allow(dead_code)]
 pub type Triangle = [[f32; 3]; 3];
+
+pub type Segment = [[f32; 3]; 2];
 
 #[allow(dead_code)]
 type Transform = [[f32; 4]; 3];
@@ -61,11 +75,65 @@ pub fn parse_3mf(name: String, bytes: Vec<u8>) -> Result<ModelMesh> {
         .take(MAX_MODEL_XML_BYTES + 1)
         .read_to_string(&mut xml)
         .context("3MF model XML is not valid UTF-8")?;
-    parse_model_xml(name, &xml)
+    let triangles = mesh_triangles(&xml)?;
+    if !triangles.is_empty() {
+        return Ok(from_triangles(name, triangles));
+    }
+
+    // Sliced exports keep only G-code; preview the first plate's toolpaths instead.
+    let gcode_index = (0..archive.len())
+        .filter_map(|index| {
+            let entry = archive.by_index(index).ok()?;
+            let plate = entry
+                .name()
+                .strip_prefix("Metadata/plate_")?
+                .strip_suffix(".gcode")?
+                .parse::<u32>()
+                .ok()?;
+            Some((plate, index))
+        })
+        .min()
+        .map(|(_, index)| index)
+        .ok_or_else(|| anyhow!("3MF contains no mesh or sliced G-code"))?;
+    let toolpaths = parse_gcode(BufReader::new(archive.by_index(gcode_index)?))?;
+    if toolpaths.is_empty() {
+        bail!("3MF G-code contains no printable extrusion");
+    }
+    let (min, max) = bounds(toolpaths.iter().flatten());
+    Ok(ModelMesh {
+        name,
+        triangles: Vec::new(),
+        toolpaths,
+        min,
+        max,
+        source_triangles: 0,
+    })
 }
 
-#[allow(dead_code)]
-fn parse_model_xml(name: String, xml: &str) -> Result<ModelMesh> {
+fn from_triangles(name: String, expanded: Vec<Triangle>) -> ModelMesh {
+    let source_triangles = expanded.len();
+    let triangles: Vec<Triangle> = if source_triangles > MAX_RENDER_TRIANGLES {
+        let step = source_triangles as f64 / MAX_RENDER_TRIANGLES as f64;
+        (0..MAX_RENDER_TRIANGLES)
+            .map(|index| expanded[(index as f64 * step) as usize])
+            .collect()
+    } else {
+        expanded
+    };
+    let (min, max) = bounds(triangles.iter().flatten());
+    ModelMesh {
+        name,
+        triangles,
+        toolpaths: Vec::new(),
+        min,
+        max,
+        source_triangles,
+    }
+}
+
+/// Expand the build items of a 3MF model document into world-space triangles.
+/// Returns an empty list when the document has no geometry.
+fn mesh_triangles(xml: &str) -> Result<Vec<Triangle>> {
     let document = roxmltree::Document::parse(xml).context("invalid 3MF model XML")?;
     let model = document
         .descendants()
@@ -170,27 +238,199 @@ fn parse_model_xml(name: String, xml: &str) -> Result<ModelMesh> {
             expand_object(id, transform, 0, &objects, &mut expanded)?;
         }
     }
-    if expanded.is_empty() {
-        bail!("3MF contains no renderable triangles");
+    Ok(expanded)
+}
+
+/// G-code features that outline the part. Infill, supports, and start/end
+/// sequences (`Custom`) are skipped to keep the preview readable.
+fn feature_is_shown(feature: &str) -> bool {
+    let feature = feature.to_ascii_lowercase();
+    !(feature.contains("infill")
+        || feature.contains("support")
+        || feature.contains("tower")
+        || feature == "custom")
+}
+
+#[derive(Default)]
+struct ToolpathBuilder {
+    segments: Vec<(u32, Segment)>,
+    position: [f32; 3],
+    /// Start of the extrusion run not yet emitted as a segment.
+    pending: Option<[f32; 3]>,
+    layer: u32,
+    layer_z: Option<f32>,
+    /// Only layers divisible by this are kept; doubles whenever the budget is exceeded.
+    stride: u32,
+}
+
+impl ToolpathBuilder {
+    fn extrude_to(&mut self, point: [f32; 3]) {
+        if self.layer_z != Some(point[2]) {
+            self.flush();
+            if self.layer_z.is_some() {
+                self.layer += 1;
+            }
+            self.layer_z = Some(point[2]);
+        }
+        let start = *self.pending.get_or_insert(self.position);
+        self.position = point;
+        if distance(start, point) >= MIN_SEGMENT_MM {
+            self.push([start, point]);
+            self.pending = Some(point);
+        }
     }
 
-    let source_triangles = expanded.len();
-    let triangles = if source_triangles > MAX_RENDER_TRIANGLES {
-        let step = source_triangles as f64 / MAX_RENDER_TRIANGLES as f64;
-        (0..MAX_RENDER_TRIANGLES)
-            .map(|index| expanded[(index as f64 * step) as usize])
-            .collect()
-    } else {
-        expanded
+    fn move_to(&mut self, point: [f32; 3]) {
+        self.flush();
+        self.position = point;
+    }
+
+    fn flush(&mut self) {
+        if let Some(start) = self.pending.take()
+            && start != self.position
+        {
+            self.push([start, self.position]);
+        }
+    }
+
+    fn push(&mut self, segment: Segment) {
+        if !self.layer.is_multiple_of(self.stride) {
+            return;
+        }
+        self.segments.push((self.layer, segment));
+        while self.segments.len() > MAX_RENDER_SEGMENTS {
+            self.stride *= 2;
+            let stride = self.stride;
+            self.segments
+                .retain(|(layer, _)| layer.is_multiple_of(stride));
+        }
+    }
+}
+
+/// Extract extrusion toolpaths from slicer G-code, streaming line by line so
+/// large prints never need to be held in memory.
+fn parse_gcode(reader: impl BufRead) -> Result<Vec<Segment>> {
+    let mut builder = ToolpathBuilder {
+        stride: 1,
+        ..Default::default()
     };
-    let (min, max) = bounds(&triangles);
-    Ok(ModelMesh {
-        name,
-        triangles,
-        min,
-        max,
-        source_triangles,
+    let mut absolute_xyz = true;
+    let mut relative_e = false;
+    let mut last_e = 0.0_f32;
+    let mut shown = false;
+
+    for line in reader.split(b'\n') {
+        let line = line.context("could not read 3MF G-code")?;
+        let line = String::from_utf8_lossy(&line);
+        let (code, comment) = line.split_once(';').unwrap_or((&line, ""));
+        if let Some(feature) = comment.trim().strip_prefix("FEATURE:") {
+            builder.flush();
+            shown = feature_is_shown(feature.trim());
+            continue;
+        }
+        let mut words = code.split_whitespace();
+        let Some(command) = words.next() else {
+            continue;
+        };
+        let mut params = [None::<f32>; 6];
+        for word in words {
+            let mut chars = word.chars();
+            let slot = match chars.next().map(|c| c.to_ascii_uppercase()) {
+                Some('X') => 0,
+                Some('Y') => 1,
+                Some('Z') => 2,
+                Some('E') => 3,
+                Some('I') => 4,
+                Some('J') => 5,
+                _ => continue,
+            };
+            params[slot] = chars.as_str().parse().ok();
+        }
+        let [x, y, z, e, i, j] = params;
+
+        match command.to_ascii_uppercase().as_str() {
+            "G90" => absolute_xyz = true,
+            "G91" => absolute_xyz = false,
+            "M82" => relative_e = false,
+            "M83" => relative_e = true,
+            "G92" => {
+                if let Some(e) = e {
+                    last_e = e;
+                }
+            }
+            command @ ("G0" | "G1" | "G2" | "G3") => {
+                let from = builder.position;
+                let axis = |value: Option<f32>, index: usize| match value {
+                    Some(value) if absolute_xyz => value,
+                    Some(value) => from[index] + value,
+                    None => from[index],
+                };
+                let target = [axis(x, 0), axis(y, 1), axis(z, 2)];
+                let extruded = match e {
+                    Some(e) if relative_e => e,
+                    Some(e) => {
+                        let delta = e - last_e;
+                        last_e = e;
+                        delta
+                    }
+                    None => 0.0,
+                };
+                if !(shown && extruded > 0.0 && command != "G0") || target == from {
+                    builder.move_to(target);
+                } else if command == "G1" {
+                    builder.extrude_to(target);
+                } else {
+                    let center = [from[0] + i.unwrap_or(0.0), from[1] + j.unwrap_or(0.0)];
+                    for point in arc_points(from, target, center, command == "G2") {
+                        builder.extrude_to(point);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    builder.flush();
+    Ok(builder
+        .segments
+        .into_iter()
+        .map(|(_, segment)| segment)
+        .collect())
+}
+
+/// Flatten a G2 (clockwise) or G3 (counter-clockwise) arc into points, ending at `to`.
+fn arc_points(
+    from: [f32; 3],
+    to: [f32; 3],
+    center: [f32; 2],
+    clockwise: bool,
+) -> impl Iterator<Item = [f32; 3]> {
+    use std::f32::consts::TAU;
+    let radius = (from[0] - center[0]).hypot(from[1] - center[1]);
+    let start = (from[1] - center[1]).atan2(from[0] - center[0]);
+    let end = (to[1] - center[1]).atan2(to[0] - center[0]);
+    let mut sweep = end - start;
+    if clockwise && sweep >= 0.0 {
+        sweep -= TAU;
+    } else if !clockwise && sweep <= 0.0 {
+        sweep += TAU;
+    }
+    let steps = ((sweep.abs() * radius / ARC_CHORD_MM).ceil() as usize).clamp(1, 360);
+    (1..=steps).map(move |step| {
+        if step == steps {
+            return to;
+        }
+        let t = step as f32 / steps as f32;
+        let angle = start + sweep * t;
+        [
+            center[0] + radius * angle.cos(),
+            center[1] + radius * angle.sin(),
+            from[2] + (to[2] - from[2]) * t,
+        ]
     })
+}
+
+fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
 #[allow(dead_code)]
@@ -328,10 +568,10 @@ fn compose(parent: Transform, child: Transform) -> Transform {
 }
 
 #[allow(dead_code)]
-fn bounds(triangles: &[Triangle]) -> ([f32; 3], [f32; 3]) {
+fn bounds<'a>(points: impl Iterator<Item = &'a [f32; 3]>) -> ([f32; 3], [f32; 3]) {
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    for point in triangles.iter().flatten() {
+    for point in points {
         for axis in 0..3 {
             min[axis] = min[axis].min(point[axis]);
             max[axis] = max[axis].max(point[axis]);
@@ -347,9 +587,24 @@ mod tests {
     #[test]
     fn parses_and_places_a_mesh() {
         let xml = r#"<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><object id="1" type="model"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="0" y="10" z="5"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources><build><item objectid="1" transform="1 0 0 0 1 0 0 0 1 20 30 0"/></build></model>"#;
-        let model = parse_model_xml("test.3mf".into(), xml).unwrap();
+        let model = from_triangles("test.3mf".into(), mesh_triangles(xml).unwrap());
         assert_eq!(model.source_triangles, 1);
         assert_eq!(model.min, [20.0, 30.0, 0.0]);
         assert_eq!(model.max, [30.0, 40.0, 5.0]);
+    }
+
+    #[test]
+    fn extracts_shown_gcode_toolpaths() {
+        let gcode = "M83\n; FEATURE: Custom\nG1 X0 Y0 Z0.2\nG1 X50 Y0 E5\n\
+            ; FEATURE: Outer wall\nG0 X10 Y10\nG1 X20 Y10 E1\n\
+            G3 X10 Y10 I-5 J0 E1\n; FEATURE: Sparse infill\nG1 X20 Y20 E1\n";
+        let segments = parse_gcode(gcode.as_bytes()).unwrap();
+        // One straight wall plus a flattened half circle; purge line and infill skipped.
+        assert!(segments.len() > 2);
+        assert_eq!(segments[0], [[10.0, 10.0, 0.2], [20.0, 10.0, 0.2]]);
+        assert_eq!(segments.last().unwrap()[1], [10.0, 10.0, 0.2]);
+        let (min, max) = bounds(segments.iter().flatten());
+        assert!(min[1] < 10.0 - 4.9 || max[1] > 10.0 + 4.9);
+        assert!(max[0] <= 20.0 + 1e-3);
     }
 }

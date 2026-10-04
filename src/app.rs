@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use directories::ProjectDirs;
 use gpui::{
@@ -12,6 +12,7 @@ use crate::{
         ConnectionState, HistoryEntry, PrinterConfig, PrinterStatus, ServiceHealth, ServiceState,
         SessionHistory, TelemetryPoint,
     },
+    model_3mf::ModelMesh,
     network::{NetworkCommand, NetworkEvent, NetworkHandle},
     printer_view::{self, PrinterOrbit},
     theme::{self, Theme},
@@ -47,8 +48,15 @@ pub struct BambuApp {
     ftps_message: Option<String>,
     /// Set once the Files page has issued its initial listing, so renders don't re-request it.
     ftps_requested: bool,
-    model_mesh: Option<std::sync::Arc<crate::model_3mf::ModelMesh>>,
-    model_path: String,
+    /// Model for the job the printer reports, shown in the Overview twin.
+    job_model: Option<Arc<ModelMesh>>,
+    /// Job name the current `job_model` request was made for.
+    job_model_name: String,
+    /// Files-tab preview: selected path, its parsed model, and loading flag.
+    file_preview_path: Option<String>,
+    file_preview: Option<Arc<ModelMesh>>,
+    file_loading: bool,
+    file_orbit: PrinterOrbit,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
     _poll_ftps: Task<()>,
@@ -138,8 +146,12 @@ impl BambuApp {
             ftps_path: "/".into(),
             ftps_message: None,
             ftps_requested: false,
-            model_mesh: None,
-            model_path: String::new(),
+            job_model: None,
+            job_model_name: String::new(),
+            file_preview_path: None,
+            file_preview: None,
+            file_loading: false,
+            file_orbit: PrinterOrbit::default(),
             _subscriptions: subscriptions,
             _poll: poll,
             _poll_ftps: cx.spawn(async move |this, cx| {
@@ -197,6 +209,7 @@ impl BambuApp {
                         self.history.push_event(entry);
                     }
                     self.history.sample(&self.status);
+                    self.request_job_model();
                 }
                 NetworkEvent::ServiceProbe {
                     port,
@@ -230,16 +243,25 @@ impl BambuApp {
                     self.ftps_entries = entries;
                     self.ftps_message = None;
                 }
-                crate::ftps::FtpsEvent::LoadingModel(path) => {
-                    self.ftps_message = Some(format!("Parsing {path}…"));
-                }
+                crate::ftps::FtpsEvent::LoadingModel(_) => {}
                 crate::ftps::FtpsEvent::ModelLoaded { remote_path, model } => {
-                    self.model_path = remote_path;
-                    self.model_mesh = Some(std::sync::Arc::new(model));
-                    self.ftps_message = None;
-                    self.screen = Screen::Overview;
+                    // Ignore a finished load the user has since clicked away from.
+                    if self.file_preview_path.as_deref() == Some(remote_path.as_str()) {
+                        self.file_preview = Some(Arc::new(model));
+                        self.file_loading = false;
+                        self.ftps_message = None;
+                    }
+                }
+                crate::ftps::FtpsEvent::JobModelLoaded { job_name, model } => {
+                    if job_name == self.job_model_name {
+                        self.job_model = Some(Arc::new(model));
+                    }
+                }
+                crate::ftps::FtpsEvent::JobModelUnavailable { job_name, error } => {
+                    tracing::warn!("no model for job {job_name}: {error}");
                 }
                 crate::ftps::FtpsEvent::Error(message) => {
+                    self.file_loading = false;
                     self.ftps_message = Some(message);
                 }
             }
@@ -256,7 +278,25 @@ impl BambuApp {
         });
     }
 
-    fn ftps_load_model(&self, path: &str) {
+    /// Fetch the model for the printer's current job when the job changes.
+    fn request_job_model(&mut self) {
+        let job = self.status.job_name.trim();
+        if job.is_empty() || job == self.job_model_name || !self.config.is_complete() {
+            return;
+        }
+        self.job_model_name = job.to_owned();
+        self.job_model = None;
+        self.ftps.send(crate::ftps::FtpsCommand::LoadJob {
+            config: self.config.clone(),
+            job_name: self.job_model_name.clone(),
+        });
+    }
+
+    fn ftps_load_model(&mut self, path: &str) {
+        self.file_preview_path = Some(path.to_owned());
+        self.file_preview = None;
+        self.file_loading = true;
+        self.ftps_message = None;
         self.ftps.send(crate::ftps::FtpsCommand::LoadModel {
             config: self.config.clone(),
             remote_path: path.to_owned(),
@@ -279,6 +319,11 @@ impl BambuApp {
         self.ftps_requested = false;
         self.ftps_entries.clear();
         self.ftps_path = "/".into();
+        self.file_preview_path = None;
+        self.file_preview = None;
+        self.file_loading = false;
+        self.job_model_name.clear();
+        self.job_model = None;
         if let Some(path) = &self.config_path {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -581,60 +626,32 @@ impl BambuApp {
                     ),
             )
             .child(
-                div()
-                    .id("printer-scene")
-                    .mt(px(12.0))
-                    .h(px(390.0))
-                    .w_full()
-                    .relative()
-                    .overflow_hidden()
-                    .rounded(px(9.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .cursor(gpui::CursorStyle::Crosshair)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|app, event: &gpui::MouseDownEvent, _, cx| {
-                            app.orbit.dragging = Some(event.position);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|app, _, _, _| app.orbit.dragging = None),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|app, _, _, _| app.orbit.dragging = None),
-                    )
-                    .on_mouse_move(cx.listener(|app, event: &gpui::MouseMoveEvent, _, cx| {
-                        if event.pressed_button == Some(MouseButton::Left)
-                            && let Some(last) = app.orbit.dragging.replace(event.position)
-                        {
-                            app.orbit.yaw += f32::from(event.position.x - last.x) * 0.007;
-                            app.orbit.pitch = (app.orbit.pitch
-                                - f32::from(event.position.y - last.y) * 0.005)
-                                .clamp(-0.18, 0.72);
-                            cx.notify();
-                        }
-                    }))
-                    .child(printer_view::scene(
-                        &status,
-                        self.model_mesh.clone(),
-                        yaw,
-                        pitch,
-                        theme,
-                    ))
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(12.0))
-                            .bottom(px(10.0))
-                            .font_family("Geist Mono")
-                            .text_size(px(8.5))
-                            .text_color(theme.text_faint)
-                            .child("DRAG TO ORBIT"),
-                    ),
+                orbit_surface(
+                    "printer-scene",
+                    theme,
+                    |app| &mut app.orbit,
+                    (-0.18, 0.72),
+                    cx,
+                )
+                .mt(px(12.0))
+                .h(px(390.0))
+                .child(printer_view::scene(
+                    &status,
+                    self.job_model.clone(),
+                    yaw,
+                    pitch,
+                    theme,
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(12.0))
+                        .bottom(px(10.0))
+                        .font_family("Geist Mono")
+                        .text_size(px(8.5))
+                        .text_color(theme.text_faint)
+                        .child("DRAG TO ORBIT"),
+                ),
             )
             .child(
                 div()
@@ -749,7 +766,7 @@ impl BambuApp {
             .into_any_element()
     }
 
-    fn render_history(&self, theme: Theme) -> AnyElement {
+    fn render_history(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
         let points: Vec<_> = self.history.telemetry.iter().cloned().collect();
         let mut events = div().mt(px(10.0)).flex().flex_col();
         if self.history.events.is_empty() {
@@ -776,9 +793,14 @@ impl BambuApp {
                 .child(theme::eyebrow(theme, "THERMAL TELEMETRY"))
                 .child(
                     div()
+                        .id("telemetry-chart")
                         .mt(px(10.0))
                         .h(px(235.0))
                         .w_full()
+                        // The chart paints its hover readout from the live mouse
+                        // position, so repaint as the pointer moves or leaves.
+                        .on_mouse_move(cx.listener(|_, _, _, cx| cx.notify()))
+                        .on_hover(cx.listener(|_, _, _, cx| cx.notify()))
                         .child(telemetry_chart(points, theme)),
                 )
                 .child(
@@ -844,17 +866,21 @@ impl BambuApp {
             let is_model = entry.name.to_ascii_lowercase().ends_with(".3mf");
             let path = crate::ftps::join_path(&self.ftps_path, &entry.name);
             let is_dir = entry.is_directory;
+            let selected = self.file_preview_path.as_deref() == Some(path.as_str());
             rows = rows.child(
                 div()
                     .id(format!("ftps-row-{index}"))
                     .h(px(34.0))
                     .px(px(10.0))
                     .rounded(px(7.0))
+                    .when(selected, |row| row.bg(theme.hover).text_color(theme.accent))
                     .flex()
                     .items_center()
                     .gap(px(10.0))
                     .text_size(px(12.0))
-                    .text_color(if is_dir { theme.text } else { theme.text_muted })
+                    .when(!selected, |row| {
+                        row.text_color(if is_dir { theme.text } else { theme.text_muted })
+                    })
                     .hover(move |style| style.bg(theme.hover))
                     .cursor_pointer()
                     .child(
@@ -875,12 +901,13 @@ impl BambuApp {
                             .text_color(theme.text_faint)
                             .child(size),
                     )
-                    .on_click(cx.listener(move |app, _, _, _| {
+                    .on_click(cx.listener(move |app, _, _, cx| {
                         if is_dir {
                             app.ftps_list(&path);
                         } else if is_model {
                             app.ftps_load_model(&path);
                         }
+                        cx.notify();
                     })),
             );
         }
@@ -902,7 +929,111 @@ impl BambuApp {
                         .child(message),
                 )
             })
-            .child(theme::card(theme).mt(px(14.0)).p(px(8.0)).child(rows))
+            .child(
+                div()
+                    .mt(px(14.0))
+                    .flex()
+                    .items_start()
+                    .gap(px(12.0))
+                    .child(
+                        theme::card(theme)
+                            .w(gpui::relative(0.4))
+                            .flex_none()
+                            .p(px(8.0))
+                            .child(rows),
+                    )
+                    .child(self.render_file_preview(theme, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_preview(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let name = self
+            .file_preview_path
+            .as_deref()
+            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned());
+        let detail = match (&self.file_preview, self.file_loading) {
+            (Some(model), _) => {
+                let size = [0, 1, 2].map(|axis| model.max[axis] - model.min[axis]);
+                let kind = if model.triangles.is_empty() {
+                    format!("{} toolpath segments · sliced", model.toolpaths.len())
+                } else {
+                    format!("{} triangles", model.source_triangles)
+                };
+                format!(
+                    "{:.1} × {:.1} × {:.1} mm  ·  {kind}",
+                    size[0], size[1], size[2]
+                )
+            }
+            (None, true) => "Downloading and parsing…".to_owned(),
+            (None, false) => "Select a .3mf file to preview it".to_owned(),
+        };
+
+        let mut stage = orbit_surface(
+            "file-preview",
+            theme,
+            |app| &mut app.file_orbit,
+            (-1.2, 1.45),
+            cx,
+        )
+        .mt(px(12.0))
+        .h(px(460.0));
+        stage = match &self.file_preview {
+            Some(model) => stage
+                .child(printer_view::model_view(
+                    model.clone(),
+                    self.file_orbit.yaw,
+                    self.file_orbit.pitch,
+                    theme,
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(12.0))
+                        .bottom(px(10.0))
+                        .font_family("Geist Mono")
+                        .text_size(px(8.5))
+                        .text_color(theme.text_faint)
+                        .child("DRAG TO ORBIT"),
+                ),
+            None => stage.bg(theme::color(0x070708)).child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_faint)
+                    .child(if self.file_loading {
+                        "Loading…"
+                    } else {
+                        "No file selected"
+                    }),
+            ),
+        };
+
+        theme::card(theme)
+            .flex_1()
+            .min_w_0()
+            .p(px(16.0))
+            .child(theme::eyebrow(theme, "3D PREVIEW"))
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .truncate()
+                    .child(name.unwrap_or_else(|| "—".into())),
+            )
+            .child(
+                div()
+                    .mt(px(2.0))
+                    .font_family("Geist Mono")
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted)
+                    .child(detail),
+            )
+            .child(stage)
             .into_any_element()
     }
 
@@ -1048,7 +1179,7 @@ impl Render for BambuApp {
         let theme = Theme::dark();
         let content = match self.screen {
             Screen::Overview => self.render_overview(theme, cx),
-            Screen::History => self.render_history(theme),
+            Screen::History => self.render_history(theme, cx),
             Screen::Files => self.render_files(theme, cx),
             Screen::Settings => self.render_settings(theme, cx),
         };
@@ -1215,10 +1346,57 @@ fn empty_history(theme: Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// A bordered canvas host that orbits the camera in `select(app)` on drag.
+fn orbit_surface(
+    id: &'static str,
+    theme: Theme,
+    select: fn(&mut BambuApp) -> &mut PrinterOrbit,
+    pitch_range: (f32, f32),
+    cx: &mut Context<BambuApp>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w_full()
+        .relative()
+        .overflow_hidden()
+        .rounded(px(9.0))
+        .border_1()
+        .border_color(theme.border)
+        .cursor(gpui::CursorStyle::Crosshair)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, event: &gpui::MouseDownEvent, _, cx| {
+                select(app).dragging = Some(event.position);
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, _| select(app).dragging = None),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, _| select(app).dragging = None),
+        )
+        .on_mouse_move(
+            cx.listener(move |app, event: &gpui::MouseMoveEvent, _, cx| {
+                let orbit = select(app);
+                if event.pressed_button == Some(MouseButton::Left)
+                    && let Some(last) = orbit.dragging.replace(event.position)
+                {
+                    orbit.yaw += f32::from(event.position.x - last.x) * 0.007;
+                    orbit.pitch = (orbit.pitch - f32::from(event.position.y - last.y) * 0.005)
+                        .clamp(pitch_range.0, pitch_range.1);
+                    cx.notify();
+                }
+            }),
+        )
+}
+
 fn telemetry_chart(points: Vec<TelemetryPoint>, theme: Theme) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| (),
-        move |bounds, _, window, _| {
+        move |bounds, _, window, cx| {
             window.paint_quad(gpui::fill(bounds, theme::color(0x090909)));
             for i in 0..=4 {
                 let y = bounds.origin.y + bounds.size.height * (i as f32 / 4.0);
@@ -1242,31 +1420,140 @@ fn telemetry_chart(points: Vec<TelemetryPoint>, theme: Theme) -> impl IntoElemen
                 .map(|point| point.at.timestamp_millis() - first_at)
                 .unwrap_or(1)
                 .max(1) as f32;
-            let draw = |window: &mut Window,
-                        color: Hsla,
-                        value: &dyn Fn(&TelemetryPoint) -> Option<f32>| {
+            let x_of = |sample: &TelemetryPoint| {
+                let elapsed = (sample.at.timestamp_millis() - first_at) as f32;
+                bounds.origin.x + bounds.size.width * (elapsed / time_span)
+            };
+            let y_of = |value: f32| {
+                bounds.origin.y + bounds.size.height * (1.0 - (value / 280.0).clamp(0.0, 1.0))
+            };
+            type Series = (Hsla, fn(&TelemetryPoint) -> Option<f32>);
+            let series: [Series; 3] = [
+                (theme.warning, |p| p.nozzle),
+                (theme.accent, |p| p.bed),
+                (theme.cyan, |p| Some(p.progress)),
+            ];
+            for (color, value) in series {
                 let mut path = PathBuilder::stroke(px(1.5));
                 let mut started = false;
                 for sample in &points {
                     let Some(value) = value(sample) else { continue };
-                    let elapsed = (sample.at.timestamp_millis() - first_at) as f32;
-                    let x = bounds.origin.x + bounds.size.width * (elapsed / time_span);
-                    let y = bounds.origin.y
-                        + bounds.size.height * (1.0 - (value / 280.0).clamp(0.0, 1.0));
+                    let at = point(x_of(sample), y_of(value));
                     if started {
-                        path.line_to(point(x, y));
+                        path.line_to(at);
                     } else {
-                        path.move_to(point(x, y));
+                        path.move_to(at);
                         started = true;
                     }
                 }
                 if started && let Ok(path) = path.build() {
                     window.paint_path(path, color);
                 }
+            }
+
+            // Hover readout: snap to the sample nearest the pointer.
+            let mouse = window.mouse_position();
+            if !bounds.contains(&mouse) {
+                return;
+            }
+            let hovered_at =
+                first_at + ((mouse.x - bounds.origin.x) / bounds.size.width * time_span) as i64;
+            let after = points.partition_point(|p| p.at.timestamp_millis() < hovered_at);
+            let sample = match (after.checked_sub(1), points.get(after)) {
+                (Some(before), Some(next))
+                    if hovered_at - points[before].at.timestamp_millis()
+                        < next.at.timestamp_millis() - hovered_at =>
+                {
+                    &points[before]
+                }
+                (_, Some(next)) => next,
+                (Some(before), None) => &points[before],
+                (None, None) => return,
             };
-            draw(window, theme.warning, &|p| p.nozzle);
-            draw(window, theme.accent, &|p| p.bed);
-            draw(window, theme.cyan, &|p| Some(p.progress));
+            let x = x_of(sample);
+            paint_line(
+                window,
+                point(x, bounds.origin.y),
+                point(x, bounds.origin.y + bounds.size.height),
+                1.0,
+                theme.text_muted.opacity(0.5),
+            );
+            for (color, value) in series {
+                if let Some(value) = value(sample) {
+                    let center = point(x, y_of(value));
+                    window.paint_quad(
+                        gpui::fill(
+                            gpui::Bounds::centered_at(center, gpui::size(px(7.0), px(7.0))),
+                            color,
+                        )
+                        .corner_radii(px(3.5)),
+                    );
+                }
+            }
+
+            let reading = |value: Option<f32>, unit: &str| {
+                value.map_or("—".to_owned(), |value| format!("{value:.1}{unit}"))
+            };
+            let lines = [
+                (
+                    theme.text_muted,
+                    sample
+                        .at
+                        .with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                        .to_string(),
+                ),
+                (theme.cyan, format!("Progress  {:.0}%", sample.progress)),
+                (
+                    theme.warning,
+                    format!("Nozzle  {}", reading(sample.nozzle, " °C")),
+                ),
+                (theme.accent, format!("Bed  {}", reading(sample.bed, " °C"))),
+            ];
+            let font_size = px(10.5);
+            let line_height = px(15.0);
+            let padding = px(8.0);
+            let base_style = window.text_style();
+            let shaped: Vec<_> = lines
+                .into_iter()
+                .map(|(color, text)| {
+                    let run = gpui::TextRun {
+                        color,
+                        ..base_style.to_run(text.len())
+                    };
+                    window
+                        .text_system()
+                        .shape_line(text.into(), font_size, &[run], None)
+                })
+                .collect();
+            let width = shaped
+                .iter()
+                .map(|line| line.width)
+                .fold(px(0.0), |a, b| a.max(b))
+                + padding * 2.0;
+            let height = line_height * shaped.len() as f32 + padding * 2.0;
+            // Sit beside the pointer, flipping inward near the chart's edges.
+            let right = bounds.origin.x + bounds.size.width;
+            let bottom = bounds.origin.y + bounds.size.height;
+            let left = if mouse.x + px(12.0) + width > right {
+                mouse.x - px(12.0) - width
+            } else {
+                mouse.x + px(12.0)
+            };
+            let top = (mouse.y - height / 2.0)
+                .max(bounds.origin.y + px(4.0))
+                .min(bottom - height - px(4.0));
+            let panel = gpui::Bounds::new(point(left, top), gpui::size(width, height));
+            window.paint_quad(
+                gpui::fill(panel, theme.surface)
+                    .corner_radii(px(6.0))
+                    .border_widths(px(1.0))
+                    .border_color(theme.border_strong),
+            );
+            for (index, line) in shaped.iter().enumerate() {
+                let origin = point(left + padding, top + padding + line_height * index as f32);
+                let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+            }
         },
     )
     .size_full()

@@ -43,6 +43,11 @@ pub enum FtpsCommand {
         config: PrinterConfig,
         remote_path: String,
     },
+    /// Fetch the model for the job the printer reports, by project name.
+    LoadJob {
+        config: PrinterConfig,
+        job_name: String,
+    },
     Shutdown,
 }
 
@@ -58,6 +63,14 @@ pub enum FtpsEvent {
     ModelLoaded {
         remote_path: String,
         model: ModelMesh,
+    },
+    JobModelLoaded {
+        job_name: String,
+        model: ModelMesh,
+    },
+    JobModelUnavailable {
+        job_name: String,
+        error: String,
     },
     Error(String),
 }
@@ -130,6 +143,22 @@ fn worker(commands: mpsc::Receiver<FtpsCommand>, events: mpsc::Sender<FtpsEvent>
                     Err(error) => {
                         let _ =
                             events.send(FtpsEvent::Error(format!("3MF preview failed: {error:#}")));
+                    }
+                }
+            }
+            FtpsCommand::LoadJob { config, job_name } => {
+                let candidates = job_paths(&job_name);
+                match download_first(&config, &candidates)
+                    .and_then(|(path, bytes)| parse_3mf(path, bytes))
+                {
+                    Ok(model) => {
+                        let _ = events.send(FtpsEvent::JobModelLoaded { job_name, model });
+                    }
+                    Err(error) => {
+                        let _ = events.send(FtpsEvent::JobModelUnavailable {
+                            job_name,
+                            error: format!("{error:#}"),
+                        });
                     }
                 }
             }
@@ -281,6 +310,40 @@ fn download(config: &PrinterConfig, remote_path: &str) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
+/// Where Bambu Studio leaves a job's sliced project on the SD card.
+fn job_paths(job_name: &str) -> Vec<String> {
+    let name = job_name.trim().trim_start_matches('/');
+    let file = if name.ends_with(".3mf") {
+        name.to_owned()
+    } else {
+        format!("{name}.gcode.3mf")
+    };
+    vec![format!("/{file}"), format!("/cache/{file}")]
+}
+
+/// Download the first of `candidates` that exists, over a single session.
+fn download_first(
+    config: &PrinterConfig,
+    candidates: &[String],
+) -> anyhow::Result<(String, Vec<u8>)> {
+    let mut ftp = connect(config)?;
+    let mut last_error = None;
+    for path in candidates {
+        match ftp.retr_as_buffer(path) {
+            Ok(buffer) => {
+                let _ = ftp.quit();
+                return Ok((path.clone(), buffer.into_inner()));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let _ = ftp.quit();
+    Err(anyhow::anyhow!(
+        "job file not found ({})",
+        last_error.map_or_else(|| "no candidates".into(), |error| error.to_string())
+    ))
+}
+
 #[allow(dead_code, unused_variables)]
 #[allow(unfulfilled_lint_expectations)]
 pub fn join_path(parent: &str, child: &str) -> String {
@@ -311,5 +374,16 @@ mod tests {
         assert_eq!(join_path("/cache", "part.3mf"), "/cache/part.3mf");
         assert_eq!(parent_path("/cache/part.3mf"), "/cache");
         assert_eq!(parent_path("/cache"), "/");
+    }
+
+    #[test]
+    fn job_paths_cover_root_and_cache() {
+        assert_eq!(
+            job_paths("rohan_spinning_top"),
+            [
+                "/rohan_spinning_top.gcode.3mf",
+                "/cache/rohan_spinning_top.gcode.3mf"
+            ]
+        );
     }
 }
