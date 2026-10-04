@@ -10,9 +10,12 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 directories = "6"
 futures = "0.3"
+# Frame buffers for gpui::RenderImage; same version gpui uses.
+image = { version = "0.25", default-features = false }
 gpui = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
 gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6", features = ["wayland", "x11", "font-kit", "runtime_shaders"] }
 gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
+mp4 = "0.14"
 roxmltree = "0.21"
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
 rustls = "0.22"

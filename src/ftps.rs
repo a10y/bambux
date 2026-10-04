@@ -1,8 +1,11 @@
 use std::{
+    collections::VecDeque,
+    fs,
     net::{TcpStream, ToSocketAddrs},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, mpsc},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -16,32 +19,29 @@ use suppaftp::{
     FtpError, RustlsConnector, RustlsFtpStream, Status, list::File as ListedFile, types::FileType,
 };
 
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
-
 use crate::{
     model::PrinterConfig,
     model_3mf::{ModelMesh, parse_3mf},
+    prints::{self, PrintDetails, PrintRecord, RemoteFile, Timelapse},
 };
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct FtpsEntry {
-    pub name: String,
-    pub is_directory: bool,
-    pub size: usize,
-    pub modified: Option<SystemTime>,
-}
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum FtpsCommand {
-    List {
+    /// List projects and timelapses, then prefetch their metadata in the background.
+    ScanPrints {
         config: PrinterConfig,
-        path: String,
     },
-    LoadModel {
+    LoadPrintModel {
         config: PrinterConfig,
-        remote_path: String,
+        key: String,
+        file: RemoteFile,
+    },
+    FetchTimelapse {
+        config: PrinterConfig,
+        key: String,
+        timelapse: Timelapse,
     },
     /// Fetch the model for the job the printer reports, by project name.
     LoadJob {
@@ -51,44 +51,40 @@ pub enum FtpsCommand {
     Shutdown,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum FtpsEvent {
-    LoadingDirectory(String),
-    Listing {
-        path: String,
-        entries: Vec<FtpsEntry>,
-    },
-    LoadingModel(String),
-    ModelLoaded {
-        remote_path: String,
-        model: ModelMesh,
-    },
-    JobModelLoaded {
-        job_name: String,
-        model: ModelMesh,
-    },
-    JobModelUnavailable {
-        job_name: String,
-        error: String,
-    },
-    Error(String),
+    PrintsScanned(Vec<PrintRecord>),
+    ScanFailed(String),
+    PrintDetails { key: String, details: PrintDetails },
+    TimelapseThumbnail { key: String, jpeg: Arc<Vec<u8>> },
+    PrintModelLoaded { key: String, model: ModelMesh },
+    PrintModelFailed { key: String, error: String },
+    TimelapseReady { key: String, path: PathBuf },
+    TimelapseFailed { key: String, error: String },
+    JobModelLoaded { job_name: String, model: ModelMesh },
+    JobModelUnavailable { job_name: String, error: String },
 }
 
-#[allow(dead_code)]
 pub struct FtpsHandle {
     commands: mpsc::Sender<FtpsCommand>,
     pub events: mpsc::Receiver<FtpsEvent>,
 }
 
-#[allow(dead_code, unused_variables)]
 impl FtpsHandle {
-    pub fn spawn() -> Self {
+    /// `cache_dir` holds downloaded projects and videos between runs.
+    pub fn spawn(cache_dir: PathBuf) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("bambux-ftps".into())
-            .spawn(move || worker(command_rx, event_tx))
+            .spawn(move || {
+                Worker {
+                    events: event_tx,
+                    cache_dir,
+                    session: None,
+                }
+                .run(command_rx)
+            })
             .expect("spawn FTPS worker");
         Self {
             commands: command_tx,
@@ -107,68 +103,308 @@ impl Drop for FtpsHandle {
     }
 }
 
-#[allow(dead_code, unused_variables)]
-#[allow(unfulfilled_lint_expectations)]
-fn worker(commands: mpsc::Receiver<FtpsCommand>, events: mpsc::Sender<FtpsEvent>) {
-    while let Ok(command) = commands.recv() {
-        match command {
-            FtpsCommand::List { config, path } => {
-                let _ = events.send(FtpsEvent::LoadingDirectory(path.clone()));
-                match list_directory(&config, &path) {
-                    Ok(entries) => {
-                        let _ = events.send(FtpsEvent::Listing { path, entries });
+/// Background work queued after a scan; runs only while no command is waiting.
+enum Prefetch {
+    Thumbnail {
+        config: PrinterConfig,
+        key: String,
+        path: String,
+    },
+    Details {
+        config: PrinterConfig,
+        key: String,
+        file: RemoteFile,
+    },
+}
+
+struct Worker {
+    events: mpsc::Sender<FtpsEvent>,
+    cache_dir: PathBuf,
+    /// One control session reused across operations; reconnected on failure.
+    session: Option<(PrinterConfig, RustlsFtpStream)>,
+}
+
+impl Worker {
+    fn run(mut self, commands: mpsc::Receiver<FtpsCommand>) {
+        let mut prefetch = VecDeque::new();
+        loop {
+            // Interactive commands always pre-empt queued prefetch work.
+            let command = match commands.try_recv() {
+                Ok(command) => command,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if let Some(job) = prefetch.pop_front() {
+                        self.prefetch(job);
+                        continue;
                     }
-                    Err(error) => {
-                        let _ =
-                            events.send(FtpsEvent::Error(format!("FTPS browse failed: {error:#}")));
+                    match commands.recv() {
+                        Ok(command) => command,
+                        Err(_) => break,
                     }
                 }
-            }
-            FtpsCommand::LoadModel {
-                config,
-                remote_path,
-            } => {
-                let _ = events.send(FtpsEvent::LoadingModel(remote_path.clone()));
-                match download(&config, &remote_path).and_then(|bytes| {
-                    let name = remote_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&remote_path)
-                        .to_owned();
-                    parse_3mf(name, bytes)
-                }) {
-                    Ok(model) => {
-                        let _ = events.send(FtpsEvent::ModelLoaded { remote_path, model });
-                    }
-                    Err(error) => {
-                        let _ =
-                            events.send(FtpsEvent::Error(format!("3MF preview failed: {error:#}")));
+            };
+            match command {
+                FtpsCommand::ScanPrints { config } => {
+                    prefetch.clear();
+                    match self.scan(&config) {
+                        Ok(records) => {
+                            prefetch.extend(records.iter().filter_map(|record| {
+                                Some(Prefetch::Thumbnail {
+                                    config: config.clone(),
+                                    key: record.key.clone(),
+                                    path: record.timelapse.as_ref()?.thumbnail_path.clone(),
+                                })
+                            }));
+                            prefetch.extend(records.iter().filter_map(|record| {
+                                Some(Prefetch::Details {
+                                    config: config.clone(),
+                                    key: record.key.clone(),
+                                    file: record.file.clone()?,
+                                })
+                            }));
+                            self.emit(FtpsEvent::PrintsScanned(records));
+                        }
+                        Err(error) => self.emit(FtpsEvent::ScanFailed(format!("{error:#}"))),
                     }
                 }
-            }
-            FtpsCommand::LoadJob { config, job_name } => {
-                let candidates = job_paths(&job_name);
-                match download_first(&config, &candidates)
-                    .and_then(|(path, bytes)| parse_3mf(path, bytes))
-                {
-                    Ok(model) => {
-                        let _ = events.send(FtpsEvent::JobModelLoaded { job_name, model });
-                    }
-                    Err(error) => {
-                        let _ = events.send(FtpsEvent::JobModelUnavailable {
+                FtpsCommand::LoadPrintModel { config, key, file } => {
+                    let result = self
+                        .fetch_bytes(
+                            &config,
+                            &file.path,
+                            Some(file.size),
+                            file.modified.timestamp(),
+                        )
+                        .and_then(|bytes| parse_3mf(prints::project_name(&file.path), bytes));
+                    self.emit(match result {
+                        Ok(model) => FtpsEvent::PrintModelLoaded { key, model },
+                        Err(error) => FtpsEvent::PrintModelFailed {
+                            key,
+                            error: format!("{error:#}"),
+                        },
+                    });
+                }
+                FtpsCommand::FetchTimelapse {
+                    config,
+                    key,
+                    timelapse,
+                } => {
+                    let stamp = timelapse.named_at.and_utc().timestamp();
+                    let result = self.fetch_file(
+                        &config,
+                        &timelapse.video_path,
+                        Some(timelapse.size),
+                        stamp,
+                    );
+                    self.emit(match result {
+                        Ok(path) => FtpsEvent::TimelapseReady { key, path },
+                        Err(error) => FtpsEvent::TimelapseFailed {
+                            key,
+                            error: format!("{error:#}"),
+                        },
+                    });
+                }
+                FtpsCommand::LoadJob { config, job_name } => {
+                    let result = self
+                        .download_first(&config, &job_paths(&job_name))
+                        .and_then(|(path, bytes)| parse_3mf(path, bytes));
+                    self.emit(match result {
+                        Ok(model) => FtpsEvent::JobModelLoaded { job_name, model },
+                        Err(error) => FtpsEvent::JobModelUnavailable {
                             job_name,
                             error: format!("{error:#}"),
-                        });
+                        },
+                    });
+                }
+                FtpsCommand::Shutdown => break,
+            }
+        }
+        if let Some((_, mut ftp)) = self.session.take() {
+            let _ = ftp.quit();
+        }
+    }
+
+    fn emit(&self, event: FtpsEvent) {
+        let _ = self.events.send(event);
+    }
+
+    fn prefetch(&mut self, job: Prefetch) {
+        match job {
+            Prefetch::Thumbnail { config, key, path } => {
+                if let Ok(bytes) = self.fetch_bytes(&config, &path, None, 0) {
+                    self.emit(FtpsEvent::TimelapseThumbnail {
+                        key,
+                        jpeg: Arc::new(bytes),
+                    });
+                }
+            }
+            Prefetch::Details { config, key, file } => {
+                let details = self
+                    .fetch_bytes(
+                        &config,
+                        &file.path,
+                        Some(file.size),
+                        file.modified.timestamp(),
+                    )
+                    .and_then(|bytes| prints::read_details(&bytes));
+                match details {
+                    Ok(details) => self.emit(FtpsEvent::PrintDetails { key, details }),
+                    Err(error) => tracing::warn!("no details for {}: {error:#}", file.path),
+                }
+            }
+        }
+    }
+
+    /// Run `op` on the shared session, reconnecting once if a reused session
+    /// turns out to be stale.
+    fn with_ftp<T>(
+        &mut self,
+        config: &PrinterConfig,
+        mut op: impl FnMut(&mut RustlsFtpStream) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        loop {
+            let reused = matches!(&self.session, Some((current, _)) if current == config);
+            if !reused {
+                if let Some((_, mut old)) = self.session.take() {
+                    let _ = old.quit();
+                }
+                self.session = Some((config.clone(), connect(config)?));
+            }
+            let (_, ftp) = self.session.as_mut().expect("session just ensured");
+            match op(ftp) {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    self.session = None;
+                    if !reused {
+                        return Err(error);
                     }
                 }
             }
-            FtpsCommand::Shutdown => break,
         }
+    }
+
+    fn scan(&mut self, config: &PrinterConfig) -> anyhow::Result<Vec<PrintRecord>> {
+        self.with_ftp(config, |ftp| {
+            let mut files = Vec::new();
+            for entry in list(ftp, "/")? {
+                if entry.is_directory() || !entry.name().to_ascii_lowercase().ends_with(".3mf") {
+                    continue;
+                }
+                let path = format!("/{}", entry.name());
+                let modified = ftp.mdtm(&path).with_context(|| format!("MDTM {path}"))?;
+                files.push(RemoteFile {
+                    path,
+                    size: entry.size(),
+                    modified: modified.and_utc(),
+                });
+            }
+            // Timelapse recording may never have been enabled.
+            let mut videos = Vec::new();
+            for entry in list(ftp, "/timelapse").unwrap_or_default() {
+                let Some(named_at) = prints::parse_video_name(entry.name()) else {
+                    continue;
+                };
+                let video_path = format!("/timelapse/{}", entry.name());
+                let stem = entry.name().trim_end_matches(".mp4");
+                videos.push(Timelapse {
+                    finished_at: ftp.mdtm(&video_path).ok().map(|at| at.and_utc()),
+                    thumbnail_path: format!("/timelapse/thumbnail/{stem}.jpg"),
+                    video_path,
+                    size: entry.size(),
+                    named_at,
+                });
+            }
+            Ok(prints::assemble(files, videos))
+        })
+    }
+
+    /// Download `remote` into the cache unless an intact copy is already there.
+    /// `stamp` (a modification time) keys the cache so edits are refetched.
+    fn fetch_file(
+        &mut self,
+        config: &PrinterConfig,
+        remote: &str,
+        size: Option<usize>,
+        stamp: i64,
+    ) -> anyhow::Result<PathBuf> {
+        let local = cache_path(&self.cache_dir, remote, stamp);
+        let cached = fs::metadata(&local)
+            .is_ok_and(|meta| size.is_none_or(|size| meta.len() == size as u64));
+        if cached {
+            return Ok(local);
+        }
+        let bytes = self.with_ftp(config, |ftp| {
+            Ok(ftp
+                .retr_as_buffer(remote)
+                .with_context(|| format!("download {remote}"))?
+                .into_inner())
+        })?;
+        if let Some(parent) = local.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Write then rename so an interrupted download never looks complete.
+        let partial = local.with_extension("partial");
+        fs::write(&partial, &bytes)?;
+        fs::rename(&partial, &local)?;
+        Ok(local)
+    }
+
+    fn fetch_bytes(
+        &mut self,
+        config: &PrinterConfig,
+        remote: &str,
+        size: Option<usize>,
+        stamp: i64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let path = self.fetch_file(config, remote, size, stamp)?;
+        Ok(fs::read(path)?)
+    }
+
+    /// Download the first of `candidates` that exists.
+    fn download_first(
+        &mut self,
+        config: &PrinterConfig,
+        candidates: &[String],
+    ) -> anyhow::Result<(String, Vec<u8>)> {
+        for path in candidates {
+            let found = self.with_ftp(config, |ftp| match ftp.retr_as_buffer(path) {
+                Ok(buffer) => Ok(Some(buffer.into_inner())),
+                // 550: no such file; try the next location on the same session.
+                Err(FtpError::UnexpectedResponse(response))
+                    if response.status == Status::FileUnavailable =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error.into()),
+            })?;
+            if let Some(bytes) = found {
+                return Ok((path.clone(), bytes));
+            }
+        }
+        anyhow::bail!("job file not found in {}", candidates.join(", "))
     }
 }
 
-#[allow(dead_code, unused_variables)]
-#[allow(unfulfilled_lint_expectations)]
+fn list(ftp: &mut RustlsFtpStream, path: &str) -> anyhow::Result<Vec<ListedFile>> {
+    let lines = ftp
+        .list(Some(path))
+        .with_context(|| format!("LIST {path}"))?;
+    Ok(lines
+        .iter()
+        .filter_map(|line| ListedFile::from_str(line).ok())
+        .filter(|file| !matches!(file.name(), "." | ".."))
+        .collect())
+}
+
+fn cache_path(cache_dir: &Path, remote: &str, stamp: i64) -> PathBuf {
+    let flat: String = remote
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect();
+    cache_dir.join("sd").join(format!("{stamp}-{flat}"))
+}
+
 fn connect(config: &PrinterConfig) -> anyhow::Result<RustlsFtpStream> {
     let host = config.normalized_host();
     let addr = (host.as_str(), 990)
@@ -260,56 +496,6 @@ impl ServerCertVerifier for AcceptAnyCertificate {
     }
 }
 
-#[allow(dead_code, unused_variables)]
-#[allow(unfulfilled_lint_expectations)]
-fn list_directory(config: &PrinterConfig, path: &str) -> anyhow::Result<Vec<FtpsEntry>> {
-    let mut ftp = connect(config)?;
-    ftp.cwd(path)?;
-    let lines = ftp.list(None)?;
-    let mut entries: Vec<_> = lines
-        .into_iter()
-        .filter_map(|line| {
-            if let Ok(file) = ListedFile::from_str(&line) {
-                if matches!(file.name(), "." | "..") {
-                    return None;
-                }
-                Some(FtpsEntry {
-                    name: file.name().to_owned(),
-                    is_directory: file.is_directory(),
-                    size: file.size(),
-                    modified: Some(file.modified()),
-                })
-            } else {
-                let name = line.trim().to_owned();
-                (!name.is_empty()).then_some(FtpsEntry {
-                    name,
-                    is_directory: false,
-                    size: 0,
-                    modified: None,
-                })
-            }
-        })
-        .collect();
-    entries.sort_by(|left, right| {
-        right.is_directory.cmp(&left.is_directory).then_with(|| {
-            left.name
-                .to_ascii_lowercase()
-                .cmp(&right.name.to_ascii_lowercase())
-        })
-    });
-    let _ = ftp.quit();
-    Ok(entries)
-}
-
-#[allow(dead_code, unused_variables)]
-#[allow(unfulfilled_lint_expectations)]
-fn download(config: &PrinterConfig, remote_path: &str) -> anyhow::Result<Vec<u8>> {
-    let mut ftp = connect(config)?;
-    let bytes = ftp.retr_as_buffer(remote_path)?.into_inner();
-    let _ = ftp.quit();
-    Ok(bytes)
-}
-
 /// Where Bambu Studio leaves a job's sliced project on the SD card.
 fn job_paths(job_name: &str) -> Vec<String> {
     let name = job_name.trim().trim_start_matches('/');
@@ -321,59 +507,16 @@ fn job_paths(job_name: &str) -> Vec<String> {
     vec![format!("/{file}"), format!("/cache/{file}")]
 }
 
-/// Download the first of `candidates` that exists, over a single session.
-fn download_first(
-    config: &PrinterConfig,
-    candidates: &[String],
-) -> anyhow::Result<(String, Vec<u8>)> {
-    let mut ftp = connect(config)?;
-    let mut last_error = None;
-    for path in candidates {
-        match ftp.retr_as_buffer(path) {
-            Ok(buffer) => {
-                let _ = ftp.quit();
-                return Ok((path.clone(), buffer.into_inner()));
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let _ = ftp.quit();
-    Err(anyhow::anyhow!(
-        "job file not found ({})",
-        last_error.map_or_else(|| "no candidates".into(), |error| error.to_string())
-    ))
-}
-
-#[allow(dead_code, unused_variables)]
-#[allow(unfulfilled_lint_expectations)]
-pub fn join_path(parent: &str, child: &str) -> String {
-    if parent == "/" {
-        format!("/{child}")
-    } else {
-        format!("{}/{child}", parent.trim_end_matches('/'))
-    }
-}
-
-#[allow(dead_code, unused_variables)]
-#[allow(unfulfilled_lint_expectations)]
-pub fn parent_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some(("", _)) | None => "/".into(),
-        Some((parent, _)) => parent.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn remote_paths_are_normalized() {
-        assert_eq!(join_path("/", "cache"), "/cache");
-        assert_eq!(join_path("/cache", "part.3mf"), "/cache/part.3mf");
-        assert_eq!(parent_path("/cache/part.3mf"), "/cache");
-        assert_eq!(parent_path("/cache"), "/");
+    fn cache_paths_are_flat_and_stamped() {
+        assert_eq!(
+            cache_path(Path::new("/c"), "/timelapse/thumbnail/a b.jpg", 7),
+            Path::new("/c/sd/7-timelapse_thumbnail_a b.jpg")
+        );
     }
 
     #[test]

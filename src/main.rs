@@ -4,7 +4,9 @@ mod model;
 mod model_3mf;
 mod network;
 mod printer_view;
+mod prints;
 mod theme;
+mod timelapse;
 
 use gpui::{
     App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,

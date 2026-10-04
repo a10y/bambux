@@ -1,9 +1,10 @@
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, fs, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use directories::ProjectDirs;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Hsla, IntoElement, MouseButton, PathBuilder,
-    Render, SharedString, Subscription, Task, Window, div, point, prelude::*, px,
+    AnyElement, App, Bounds, Context, Entity, FontWeight, Hsla, IntoElement, MouseButton,
+    ObjectFit, PathBuilder, Pixels, Point, Render, RenderImage, SharedString, StyledImage,
+    Subscription, Task, Window, div, img, point, prelude::*, px,
 };
 use gpui_base::input::{DiagnosticColors, Input, InputEditorStyle, InputEvent, InputState};
 
@@ -15,14 +16,16 @@ use crate::{
     model_3mf::ModelMesh,
     network::{NetworkCommand, NetworkEvent, NetworkHandle},
     printer_view::{self, PrinterOrbit},
+    prints::{PrintDetails, PrintRecord, format_duration},
     theme::{self, Theme},
+    timelapse::TimelapsePlayer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Overview,
     History,
-    Files,
+    Prints,
     Settings,
 }
 
@@ -43,23 +46,54 @@ pub struct BambuApp {
     code_input: Entity<InputState>,
     show_access_code: bool,
     titlebar_should_move: bool,
-    ftps_entries: Vec<crate::ftps::FtpsEntry>,
-    ftps_path: String,
-    ftps_message: Option<String>,
-    /// Set once the Files page has issued its initial listing, so renders don't re-request it.
-    ftps_requested: bool,
+    prints: PrintHistory,
     /// Model for the job the printer reports, shown in the Overview twin.
     job_model: Option<Arc<ModelMesh>>,
     /// Job name the current `job_model` request was made for.
     job_model_name: String,
-    /// Files-tab preview: selected path, its parsed model, and loading flag.
-    file_preview_path: Option<String>,
-    file_preview: Option<Arc<ModelMesh>>,
-    file_loading: bool,
-    file_orbit: PrinterOrbit,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
     _poll_ftps: Task<()>,
+    _poll_video: Task<()>,
+}
+
+/// State behind the Print History tab.
+#[derive(Default)]
+struct PrintHistory {
+    records: Vec<PrintRecord>,
+    requested: bool,
+    scanning: bool,
+    error: Option<String>,
+    details: HashMap<String, PrintDetails>,
+    plate_images: HashMap<String, Arc<gpui::Image>>,
+    timelapse_thumbs: HashMap<String, Arc<gpui::Image>>,
+    selected: Option<String>,
+    model: Option<Arc<ModelMesh>>,
+    /// Shown in place of the model while it loads or when it can't.
+    model_status: Option<String>,
+    orbit: PrinterOrbit,
+    player: Option<TimelapsePlayer>,
+    player_status: Option<String>,
+    player_generation: u64,
+    /// The frame painted last; replaced frames are evicted from the atlas.
+    shown_frame: Option<Arc<RenderImage>>,
+    retired_frames: Vec<Arc<RenderImage>>,
+    /// Scrub bar bounds from the last paint, for mapping clicks to time.
+    scrub_bounds: Rc<Cell<Bounds<Pixels>>>,
+}
+
+impl PrintHistory {
+    fn selected_record(&self) -> Option<&PrintRecord> {
+        let key = self.selected.as_deref()?;
+        self.records.iter().find(|record| record.key == key)
+    }
+
+    fn stop_player(&mut self) {
+        self.player = None;
+        if let Some(frame) = self.shown_frame.take() {
+            self.retired_frames.push(frame);
+        }
+    }
 }
 
 impl BambuApp {
@@ -98,7 +132,7 @@ impl BambuApp {
         ];
 
         let network = NetworkHandle::spawn();
-        let ftps = crate::ftps::FtpsHandle::spawn();
+        let ftps = crate::ftps::FtpsHandle::spawn(cache_dir());
         if has_config {
             network.send(NetworkCommand::Connect(config.clone()));
         }
@@ -142,18 +176,33 @@ impl BambuApp {
             code_input,
             show_access_code: false,
             titlebar_should_move: false,
-            ftps_entries: Vec::new(),
-            ftps_path: "/".into(),
-            ftps_message: None,
-            ftps_requested: false,
+            prints: PrintHistory::default(),
             job_model: None,
             job_model_name: String::new(),
-            file_preview_path: None,
-            file_preview: None,
-            file_loading: false,
-            file_orbit: PrinterOrbit::default(),
             _subscriptions: subscriptions,
             _poll: poll,
+            _poll_video: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(15))
+                        .await;
+                    if this
+                        .update(cx, |app, cx| {
+                            let prints = &mut app.prints;
+                            if let Some(player) = &prints.player {
+                                let generation = player.generation();
+                                if generation != prints.player_generation {
+                                    prints.player_generation = generation;
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }),
             _poll_ftps: cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()
@@ -231,51 +280,137 @@ impl BambuApp {
     }
 
     fn drain_ftps(&mut self) -> bool {
+        use crate::ftps::FtpsEvent;
         let mut changed = false;
         while let Ok(event) = self.ftps.events.try_recv() {
             changed = true;
+            let prints = &mut self.prints;
+            let selected = prints.selected.clone();
+            let is_selected = |key: &str| selected.as_deref() == Some(key);
             match event {
-                crate::ftps::FtpsEvent::LoadingDirectory(path) => {
-                    self.ftps_message = Some(format!("Listing {path}…"));
-                }
-                crate::ftps::FtpsEvent::Listing { path, entries } => {
-                    self.ftps_path = path;
-                    self.ftps_entries = entries;
-                    self.ftps_message = None;
-                }
-                crate::ftps::FtpsEvent::LoadingModel(_) => {}
-                crate::ftps::FtpsEvent::ModelLoaded { remote_path, model } => {
-                    // Ignore a finished load the user has since clicked away from.
-                    if self.file_preview_path.as_deref() == Some(remote_path.as_str()) {
-                        self.file_preview = Some(Arc::new(model));
-                        self.file_loading = false;
-                        self.ftps_message = None;
+                FtpsEvent::PrintsScanned(records) => {
+                    prints.records = records;
+                    prints.scanning = false;
+                    prints.error = None;
+                    if prints.selected_record().is_none()
+                        && let Some(first) = prints.records.first()
+                    {
+                        let key = first.key.clone();
+                        prints.selected = None;
+                        self.select_print(&key);
                     }
                 }
-                crate::ftps::FtpsEvent::JobModelLoaded { job_name, model } => {
+                FtpsEvent::ScanFailed(error) => {
+                    prints.scanning = false;
+                    prints.error = Some(format!("Could not read the SD card: {error}"));
+                }
+                FtpsEvent::PrintDetails { key, details } => {
+                    if let Some(png) = &details.plate_png {
+                        prints.plate_images.insert(
+                            key.clone(),
+                            Arc::new(gpui::Image::from_bytes(
+                                gpui::ImageFormat::Png,
+                                png.as_ref().clone(),
+                            )),
+                        );
+                    }
+                    prints.details.insert(key, details);
+                }
+                FtpsEvent::TimelapseThumbnail { key, jpeg } => {
+                    prints.timelapse_thumbs.insert(
+                        key,
+                        Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Jpeg,
+                            jpeg.as_ref().clone(),
+                        )),
+                    );
+                }
+                // Results for a print the user has since clicked away from are dropped.
+                FtpsEvent::PrintModelLoaded { key, model } => {
+                    if is_selected(&key) {
+                        prints.model = Some(Arc::new(model));
+                        prints.model_status = None;
+                    }
+                }
+                FtpsEvent::PrintModelFailed { key, error } => {
+                    if is_selected(&key) {
+                        prints.model_status =
+                            Some(format!("Couldn't render this project: {error}"));
+                    }
+                }
+                FtpsEvent::TimelapseReady { key, path } => {
+                    if is_selected(&key) {
+                        match TimelapsePlayer::open(&path) {
+                            Ok(player) => {
+                                prints.player = Some(player);
+                                prints.player_status = None;
+                            }
+                            Err(error) => prints.player_status = Some(format!("{error:#}")),
+                        }
+                    }
+                }
+                FtpsEvent::TimelapseFailed { key, error } => {
+                    if is_selected(&key) {
+                        prints.player_status =
+                            Some(format!("Couldn't download the timelapse: {error}"));
+                    }
+                }
+                FtpsEvent::JobModelLoaded { job_name, model } => {
                     if job_name == self.job_model_name {
                         self.job_model = Some(Arc::new(model));
                     }
                 }
-                crate::ftps::FtpsEvent::JobModelUnavailable { job_name, error } => {
+                FtpsEvent::JobModelUnavailable { job_name, error } => {
                     tracing::warn!("no model for job {job_name}: {error}");
-                }
-                crate::ftps::FtpsEvent::Error(message) => {
-                    self.file_loading = false;
-                    self.ftps_message = Some(message);
                 }
             }
         }
         changed
     }
 
-    fn ftps_list(&mut self, path: &str) {
-        self.ftps_requested = true;
-        self.ftps_message = Some(format!("Listing {path}…"));
-        self.ftps.send(crate::ftps::FtpsCommand::List {
+    fn scan_prints(&mut self) {
+        self.prints.requested = true;
+        self.prints.scanning = true;
+        self.prints.error = None;
+        self.ftps.send(crate::ftps::FtpsCommand::ScanPrints {
             config: self.config.clone(),
-            path: path.to_owned(),
         });
+    }
+
+    fn select_print(&mut self, key: &str) {
+        let prints = &mut self.prints;
+        if prints.selected.as_deref() == Some(key) {
+            return;
+        }
+        prints.stop_player();
+        prints.selected = Some(key.to_owned());
+        prints.model = None;
+        prints.player_status = None;
+        let Some(record) = prints.selected_record().cloned() else {
+            return;
+        };
+        prints.model_status = Some(if record.file.is_some() {
+            "Loading model…".into()
+        } else {
+            "The project file for this print is no longer on the SD card.".into()
+        });
+        if record.timelapse.is_some() {
+            prints.player_status = Some("Downloading timelapse…".into());
+        }
+        if let Some(file) = record.file {
+            self.ftps.send(crate::ftps::FtpsCommand::LoadPrintModel {
+                config: self.config.clone(),
+                key: record.key.clone(),
+                file,
+            });
+        }
+        if let Some(timelapse) = record.timelapse {
+            self.ftps.send(crate::ftps::FtpsCommand::FetchTimelapse {
+                config: self.config.clone(),
+                key: record.key,
+                timelapse,
+            });
+        }
     }
 
     /// Fetch the model for the printer's current job when the job changes.
@@ -292,17 +427,6 @@ impl BambuApp {
         });
     }
 
-    fn ftps_load_model(&mut self, path: &str) {
-        self.file_preview_path = Some(path.to_owned());
-        self.file_preview = None;
-        self.file_loading = true;
-        self.ftps_message = None;
-        self.ftps.send(crate::ftps::FtpsCommand::LoadModel {
-            config: self.config.clone(),
-            remote_path: path.to_owned(),
-        });
-    }
-
     fn draft_config(&self, cx: &App) -> PrinterConfig {
         PrinterConfig {
             host: self.host_input.read(cx).value().to_string(),
@@ -315,13 +439,13 @@ impl BambuApp {
         config.host = config.normalized_host();
         self.config = config.clone();
         self.error = None;
-        // New printer credentials: refresh the Files page from the root on next view.
-        self.ftps_requested = false;
-        self.ftps_entries.clear();
-        self.ftps_path = "/".into();
-        self.file_preview_path = None;
-        self.file_preview = None;
-        self.file_loading = false;
+        // New printer credentials: rescan print history on next view.
+        self.prints.stop_player();
+        let retired = std::mem::take(&mut self.prints.retired_frames);
+        self.prints = PrintHistory {
+            retired_frames: retired,
+            ..PrintHistory::default()
+        };
         self.job_model_name.clear();
         self.job_model = None;
         if let Some(path) = &self.config_path {
@@ -463,8 +587,8 @@ impl BambuApp {
             .flex_col()
             .child(sidebar_label(theme, "WORKSPACE"))
             .child(self.nav_item(theme, Screen::Overview, "◈", "Overview", cx))
-            .child(self.nav_item(theme, Screen::History, "⌁", "History", cx))
-            .child(self.nav_item(theme, Screen::Files, "◉", "Files", cx))
+            .child(self.nav_item(theme, Screen::Prints, "▣", "Print History", cx))
+            .child(self.nav_item(theme, Screen::History, "⌁", "Telemetry", cx))
             .child(sidebar_label(theme, "DEVICE").mt(px(20.0)))
             .child(self.nav_item(theme, Screen::Settings, "⚙", "Configuration", cx))
             .child(div().flex_1())
@@ -496,7 +620,7 @@ impl BambuApp {
             .id(match target {
                 Screen::Overview => "nav-overview",
                 Screen::History => "nav-history",
-                Screen::Files => "nav-files",
+                Screen::Prints => "nav-prints",
                 Screen::Settings => "nav-settings",
             })
             .h(px(36.0))
@@ -836,154 +960,451 @@ impl BambuApp {
         .into_any_element()
     }
 
-    fn render_files(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
-        if !self.ftps_requested && self.config.is_complete() {
-            let path = self.ftps_path.clone();
-            self.ftps_list(&path);
+    fn render_prints(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        if !self.prints.requested && self.config.is_complete() {
+            self.scan_prints();
         }
-        let mut rows = div().mt(px(14.0)).flex().flex_col().gap(px(2.0));
-        rows = rows.child(
-            theme::action(theme, false)
-                .id("ftps-up")
-                .h(px(28.0))
-                .child(format!(
-                    "..  ·  {}",
-                    crate::ftps::parent_path(&self.ftps_path)
-                ))
-                .on_click(cx.listener(|app, _, _, _| {
-                    let parent = crate::ftps::parent_path(&app.ftps_path);
-                    app.ftps_list(&parent);
-                })),
-        );
-        for (index, entry) in self.ftps_entries.clone().into_iter().enumerate() {
-            let icon = if entry.is_directory { "▸" } else { "·" };
-            let size = if entry.is_directory {
-                "".into()
-            } else {
-                format_bytes(entry.size)
-            };
-            let name = entry.name.clone();
-            let is_model = entry.name.to_ascii_lowercase().ends_with(".3mf");
-            let path = crate::ftps::join_path(&self.ftps_path, &entry.name);
-            let is_dir = entry.is_directory;
-            let selected = self.file_preview_path.as_deref() == Some(path.as_str());
-            rows = rows.child(
-                div()
-                    .id(format!("ftps-row-{index}"))
-                    .h(px(34.0))
-                    .px(px(10.0))
-                    .rounded(px(7.0))
-                    .when(selected, |row| row.bg(theme.hover).text_color(theme.accent))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .text_size(px(12.0))
-                    .when(!selected, |row| {
-                        row.text_color(if is_dir { theme.text } else { theme.text_muted })
-                    })
-                    .hover(move |style| style.bg(theme.hover))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .text_color(if is_dir {
-                                theme.accent
-                            } else {
-                                theme.text_faint
-                            })
-                            .child(icon),
-                    )
-                    .child(div().flex_1().min_w_0().child(name.clone()))
-                    .child(
-                        div()
-                            .font_family("Geist Mono")
-                            .text_size(px(10.0))
-                            .text_color(theme.text_faint)
-                            .child(size),
-                    )
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        if is_dir {
-                            app.ftps_list(&path);
-                        } else if is_model {
-                            app.ftps_load_model(&path);
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
-        page_shell(theme, "Files", "Browse printer storage over FTPS")
+
+        let status: Option<(Hsla, String)> = if let Some(error) = &self.prints.error {
+            Some((theme.warning, error.clone()))
+        } else if self.prints.scanning {
+            Some((theme.text_muted, "Reading the SD card…".into()))
+        } else if !self.config.is_complete() {
+            Some((
+                theme.text_muted,
+                "Add your printer in Configuration to see its prints.".into(),
+            ))
+        } else if self.prints.records.is_empty() {
+            Some((theme.text_muted, "No prints found on the SD card.".into()))
+        } else {
+            None
+        };
+
+        let header = div()
+            .mt(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
             .child(
                 div()
-                    .mt(px(6.0))
                     .font_family("Geist Mono")
-                    .text_size(px(11.0))
-                    .text_color(theme.accent)
-                    .child(self.ftps_path.clone()),
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
+                    .child(format!(
+                        "{} PRINTS · {} TIMELAPSES",
+                        self.prints.records.len(),
+                        self.prints
+                            .records
+                            .iter()
+                            .filter(|record| record.timelapse.is_some())
+                            .count()
+                    )),
             )
-            .when_some(self.ftps_message.clone(), |page, message| {
-                page.child(
-                    div()
-                        .mt(px(8.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.warning)
-                        .child(message),
+            .child(div().flex_1())
+            .child(
+                theme::action(theme, false)
+                    .id("prints-refresh")
+                    .h(px(28.0))
+                    .text_size(px(11.0))
+                    .child(if self.prints.scanning {
+                        "Refreshing…"
+                    } else {
+                        "Refresh"
+                    })
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        if !app.prints.scanning && app.config.is_complete() {
+                            app.scan_prints();
+                            cx.notify();
+                        }
+                    })),
+            );
+
+        let mut list = div().flex().flex_col().gap(px(2.0));
+        for (index, record) in self.prints.records.iter().enumerate() {
+            list = list.child(self.print_row(theme, index, record, cx));
+        }
+
+        page_shell(
+            theme,
+            "Print history",
+            "Every print on the SD card, with its model and timelapse",
+        )
+        .child(header)
+        .when_some(status, |page, (color, message)| {
+            page.child(
+                div()
+                    .mt(px(8.0))
+                    .text_size(px(11.5))
+                    .text_color(color)
+                    .child(message),
+            )
+        })
+        .child(
+            div()
+                .mt(px(12.0))
+                .flex()
+                .items_start()
+                .gap(px(12.0))
+                .child(
+                    theme::card(theme)
+                        .w(gpui::relative(0.34))
+                        .flex_none()
+                        .p(px(6.0))
+                        .child(list),
                 )
+                .child(self.render_print_detail(theme, cx)),
+        )
+        .into_any_element()
+    }
+
+    fn print_row(
+        &self,
+        theme: Theme,
+        index: usize,
+        record: &PrintRecord,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.prints.selected.as_deref() == Some(record.key.as_str());
+        let thumbnail = self
+            .prints
+            .plate_images
+            .get(&record.key)
+            .or_else(|| self.prints.timelapse_thumbs.get(&record.key))
+            .cloned();
+        let mut subline = record
+            .started_at
+            .with_timezone(&chrono::Local)
+            .format("%b %-d · %-I:%M %p")
+            .to_string();
+        if let Some(secs) = record.duration_secs() {
+            subline.push_str(&format!(" · {}", format_duration(secs)));
+        }
+        let key = record.key.clone();
+
+        div()
+            .id(("print-row", index))
+            .h(px(60.0))
+            .px(px(8.0))
+            .rounded(px(7.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .cursor_pointer()
+            .when(selected, |row| {
+                row.bg(theme.active)
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.24))
+            })
+            .when(!selected, |row| {
+                row.hover(move |style| style.bg(theme.hover))
             })
             .child(
                 div()
-                    .mt(px(14.0))
-                    .flex()
-                    .items_start()
-                    .gap(px(12.0))
-                    .child(
-                        theme::card(theme)
-                            .w(gpui::relative(0.4))
-                            .flex_none()
-                            .p(px(8.0))
-                            .child(rows),
-                    )
-                    .child(self.render_file_preview(theme, cx)),
+                    .w(px(58.0))
+                    .h(px(44.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .overflow_hidden()
+                    .bg(theme::color(0x070708))
+                    .border_1()
+                    .border_color(theme.border)
+                    .when_some(thumbnail, |frame, image| {
+                        frame.child(img(image).size_full().object_fit(ObjectFit::Cover))
+                    }),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(if selected {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .truncate()
+                            .child(record.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family("Geist Mono")
+                            .text_size(px(9.5))
+                            .text_color(theme.text_faint)
+                            .truncate()
+                            .child(subline),
+                    ),
+            )
+            .when(record.timelapse.is_some(), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(theme.accent)
+                        .child("▶"),
+                )
+            })
+            .on_click(cx.listener(move |app, _, _, cx| {
+                app.select_print(&key);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
-    fn render_file_preview(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
-        let name = self
-            .file_preview_path
-            .as_deref()
-            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned());
-        let detail = match (&self.file_preview, self.file_loading) {
-            (Some(model), _) => {
-                let size = [0, 1, 2].map(|axis| model.max[axis] - model.min[axis]);
-                let kind = if model.triangles.is_empty() {
-                    format!("{} toolpath segments · sliced", model.toolpaths.len())
-                } else {
-                    format!("{} triangles", model.source_triangles)
-                };
-                format!(
-                    "{:.1} × {:.1} × {:.1} mm  ·  {kind}",
-                    size[0], size[1], size[2]
-                )
-            }
-            (None, true) => "Downloading and parsing…".to_owned(),
-            (None, false) => "Select a .3mf file to preview it".to_owned(),
+    fn render_print_detail(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(record) = self.prints.selected_record().cloned() else {
+            return theme::card(theme)
+                .flex_1()
+                .min_w_0()
+                .p(px(16.0))
+                .text_size(px(11.5))
+                .text_color(theme.text_faint)
+                .child("Select a print to see its model and timelapse.")
+                .into_any_element();
         };
+        let details = self.prints.details.get(&record.key).cloned();
+
+        let mut facts: Vec<(String, Option<Hsla>)> = vec![(
+            record
+                .started_at
+                .with_timezone(&chrono::Local)
+                .format("%a %b %-d %Y, %-I:%M %p")
+                .to_string(),
+            None,
+        )];
+        if let Some(secs) = record.duration_secs() {
+            facts.push((format!("Printed in {}", format_duration(secs)), None));
+        }
+        if let Some(details) = &details {
+            if let Some(secs) = details.predicted_secs {
+                facts.push((
+                    format!("Estimated {}", format_duration(i64::from(secs))),
+                    None,
+                ));
+            }
+            for filament in &details.filaments {
+                let label = match filament.used_g {
+                    Some(grams) => format!("{} · {grams:.1} g", filament.kind),
+                    None => filament.kind.clone(),
+                };
+                facts.push((label, Some(hex_color(&filament.color))));
+            }
+            if details.filaments.is_empty()
+                && let Some(weight) = details.weight_g
+            {
+                facts.push((format!("{weight:.1} g"), None));
+            }
+        }
+        if let Some(file) = &record.file {
+            facts.push((format_bytes(file.size), None));
+        }
+
+        let summary = theme::card(theme)
+            .p(px(16.0))
+            .child(theme::eyebrow(theme, "PRINT"))
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(17.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .truncate()
+                    .child(record.name.clone()),
+            )
+            .child(
+                div().mt(px(10.0)).flex().flex_wrap().gap(px(6.0)).children(
+                    facts
+                        .into_iter()
+                        .map(|(label, swatch)| fact_chip(theme, label, swatch)),
+                ),
+            );
+
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(summary)
+            .child(self.render_timelapse(theme, &record, cx))
+            .child(self.render_print_model(theme, cx))
+            .into_any_element()
+    }
+
+    fn render_timelapse(
+        &mut self,
+        theme: Theme,
+        record: &PrintRecord,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let prints = &mut self.prints;
+        let state = prints
+            .player
+            .as_ref()
+            .map(|player| (player.state(), player.info));
+
+        // Track the painted frame so the one it replaces can be freed.
+        let frame = state.as_ref().and_then(|(state, _)| state.frame.clone());
+        let changed = match (&frame, &prints.shown_frame) {
+            (Some(new), Some(old)) => !Arc::ptr_eq(new, old),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed && let Some(old) = std::mem::replace(&mut prints.shown_frame, frame.clone()) {
+            prints.retired_frames.push(old);
+        }
+
+        let message = if record.timelapse.is_none() {
+            Some("No timelapse was recorded for this print.".to_owned())
+        } else if let Some(error) = state.as_ref().and_then(|(state, _)| state.error.clone()) {
+            Some(error)
+        } else {
+            prints.player_status.clone()
+        };
+        let poster = prints.timelapse_thumbs.get(&record.key).cloned();
+
+        let mut stage = div()
+            .mt(px(10.0))
+            .h(px(360.0))
+            .w_full()
+            .relative()
+            .overflow_hidden()
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme::color(0x050505));
+        stage = match (frame, poster) {
+            (Some(frame), _) => stage.child(img(frame).size_full().object_fit(ObjectFit::Contain)),
+            (None, Some(poster)) => stage.child(
+                img(poster)
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .opacity(0.35),
+            ),
+            (None, None) => stage,
+        };
+        if let Some(message) = message.clone() {
+            stage = stage.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(24.0))
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(message),
+            );
+        }
+
+        let controls = state.map(|(state, info)| {
+            let fraction = (state.position / info.duration).clamp(0.0, 1.0);
+            let scrub_bounds = prints.scrub_bounds.clone();
+            let seek = move |app: &mut BambuApp, position: Point<Pixels>| {
+                let bounds = app.prints.scrub_bounds.get();
+                if let Some(player) = &app.prints.player
+                    && bounds.size.width > px(0.0)
+                {
+                    player.seek_fraction((position.x - bounds.origin.x) / bounds.size.width);
+                }
+            };
+            div()
+                .mt(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    theme::action(theme, true)
+                        .id("timelapse-toggle")
+                        .w(px(64.0))
+                        .h(px(28.0))
+                        .text_size(px(11.0))
+                        .child(if state.playing { "Pause" } else { "Play" })
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            if let Some(player) = &app.prints.player {
+                                player.toggle();
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("timelapse-scrub")
+                        .flex_1()
+                        .h(px(20.0))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, event: &gpui::MouseDownEvent, _, cx| {
+                                seek(app, event.position);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            move |app, event: &gpui::MouseMoveEvent, _, _| {
+                                if event.pressed_button == Some(MouseButton::Left) {
+                                    seek(app, event.position);
+                                }
+                            },
+                        ))
+                        .child(scrub_bar(fraction, scrub_bounds, theme)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family("Geist Mono")
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(format!(
+                            "{} / {}",
+                            clock(state.position),
+                            clock(info.duration)
+                        )),
+                )
+        });
+
+        theme::card(theme)
+            .p(px(16.0))
+            .child(theme::eyebrow(theme, "TIMELAPSE"))
+            .child(stage)
+            .when_some(controls, |card, controls| card.child(controls))
+            .into_any_element()
+    }
+
+    fn render_print_model(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let prints = &self.prints;
+        let detail = prints.model.as_ref().map(|model| {
+            let size = [0, 1, 2].map(|axis| model.max[axis] - model.min[axis]);
+            let kind = if model.triangles.is_empty() {
+                format!("{} toolpath segments", model.toolpaths.len())
+            } else {
+                format!("{} triangles", model.source_triangles)
+            };
+            format!(
+                "{:.1} × {:.1} × {:.1} mm  ·  {kind}",
+                size[0], size[1], size[2]
+            )
+        });
 
         let mut stage = orbit_surface(
-            "file-preview",
+            "print-model",
             theme,
-            |app| &mut app.file_orbit,
+            |app| &mut app.prints.orbit,
             (-1.2, 1.45),
             cx,
         )
-        .mt(px(12.0))
-        .h(px(460.0));
-        stage = match &self.file_preview {
+        .mt(px(10.0))
+        .h(px(380.0));
+        stage = match &prints.model {
             Some(model) => stage
                 .child(printer_view::model_view(
                     model.clone(),
-                    self.file_orbit.yaw,
-                    self.file_orbit.pitch,
+                    prints.orbit.yaw,
+                    prints.orbit.pitch,
                     theme,
                 ))
                 .child(
@@ -1002,36 +1423,30 @@ impl BambuApp {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .px(px(24.0))
                     .text_size(px(11.5))
                     .text_color(theme.text_faint)
-                    .child(if self.file_loading {
-                        "Loading…"
-                    } else {
-                        "No file selected"
-                    }),
+                    .child(prints.model_status.clone().unwrap_or_default()),
             ),
         };
 
         theme::card(theme)
-            .flex_1()
-            .min_w_0()
             .p(px(16.0))
-            .child(theme::eyebrow(theme, "3D PREVIEW"))
             .child(
                 div()
-                    .mt(px(4.0))
-                    .text_size(px(15.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .truncate()
-                    .child(name.unwrap_or_else(|| "—".into())),
-            )
-            .child(
-                div()
-                    .mt(px(2.0))
-                    .font_family("Geist Mono")
-                    .text_size(px(10.0))
-                    .text_color(theme.text_muted)
-                    .child(detail),
+                    .flex()
+                    .items_center()
+                    .child(theme::eyebrow(theme, "MODEL"))
+                    .child(div().flex_1())
+                    .when_some(detail, |row, detail| {
+                        row.child(
+                            div()
+                                .font_family("Geist Mono")
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child(detail),
+                        )
+                    }),
             )
             .child(stage)
             .into_any_element()
@@ -1175,12 +1590,16 @@ impl BambuApp {
 }
 
 impl Render for BambuApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::dark();
+        // Timelapse frames are one-off images; free the ones no longer shown.
+        for frame in self.prints.retired_frames.drain(..) {
+            let _ = window.drop_image(frame);
+        }
         let content = match self.screen {
             Screen::Overview => self.render_overview(theme, cx),
             Screen::History => self.render_history(theme, cx),
-            Screen::Files => self.render_files(theme, cx),
+            Screen::Prints => self.render_prints(theme, cx),
             Screen::Settings => self.render_settings(theme, cx),
         };
 
@@ -1758,6 +2177,83 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn fact_chip(theme: Theme, label: String, swatch: Option<Hsla>) -> AnyElement {
+    div()
+        .h(px(24.0))
+        .px(px(9.0))
+        .rounded(px(12.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .bg(theme.hover)
+        .border_1()
+        .border_color(theme.border)
+        .text_size(px(10.5))
+        .text_color(theme.text_muted)
+        .when_some(swatch, |chip, color| {
+            chip.child(
+                status_dot(color, 8.0)
+                    .border_1()
+                    .border_color(theme.border_strong),
+            )
+        })
+        .child(label)
+        .into_any_element()
+}
+
+/// Parse a slicer `#RRGGBB` (alpha suffix ignored).
+fn hex_color(hex: &str) -> Hsla {
+    let digits = hex.trim_start_matches('#');
+    u32::from_str_radix(digits.get(..6).unwrap_or(""), 16)
+        .map(theme::color)
+        .unwrap_or_else(|_| theme::color(0x888888))
+}
+
+/// `m:ss` for timelapse positions.
+fn clock(secs: f32) -> String {
+    let secs = secs.max(0.0) as u32;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn scrub_bar(
+    fraction: f32,
+    bounds_out: Rc<Cell<Bounds<Pixels>>>,
+    theme: Theme,
+) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            bounds_out.set(bounds);
+            let track_height = px(4.0);
+            let track = Bounds::new(
+                point(bounds.origin.x, bounds.center().y - track_height / 2.0),
+                gpui::size(bounds.size.width, track_height),
+            );
+            window.paint_quad(gpui::fill(track, theme.border_strong).corner_radii(px(2.0)));
+            let filled = Bounds::new(
+                track.origin,
+                gpui::size(track.size.width * fraction, track_height),
+            );
+            window.paint_quad(gpui::fill(filled, theme.accent).corner_radii(px(2.0)));
+            let knob = Bounds::centered_at(
+                point(
+                    bounds.origin.x + bounds.size.width * fraction,
+                    bounds.center().y,
+                ),
+                gpui::size(px(12.0), px(12.0)),
+            );
+            window.paint_quad(gpui::fill(knob, theme.text).corner_radii(px(6.0)));
+        },
+    )
+    .size_full()
+}
+
+fn cache_dir() -> PathBuf {
+    ProjectDirs::from("dev", "bambux", "Bambu X")
+        .map(|dirs| dirs.cache_dir().to_owned())
+        .unwrap_or_else(|| std::env::temp_dir().join("bambux"))
 }
 
 fn config_path() -> Option<PathBuf> {
