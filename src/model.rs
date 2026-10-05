@@ -13,6 +13,13 @@ pub const TELEMETRY_LIMIT: usize = 240;
 pub struct PrinterConfig {
     pub host: String,
     pub access_code: String,
+    /// Identity from discovery; empty for printers entered by hand.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub serial: String,
 }
 
 impl PrinterConfig {
@@ -376,6 +383,7 @@ mod tests {
         let config = PrinterConfig {
             host: "https://192.168.1.20/".into(),
             access_code: "code".into(),
+            ..Default::default()
         };
         assert_eq!(config.normalized_host(), "192.168.1.20");
     }

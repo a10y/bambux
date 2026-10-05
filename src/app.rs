@@ -10,6 +10,7 @@ use gpui_base::input::{DiagnosticColors, Input, InputEditorStyle, InputEvent, In
 
 use crate::{
     ams::{ActiveSpool, AmsState, Spool},
+    discovery::DiscoveredPrinter,
     model::{
         ConnectionState, HistoryEntry, PrinterConfig, PrinterStatus, ServiceHealth, ServiceState,
         SessionHistory, TelemetryPoint,
@@ -27,6 +28,7 @@ enum Screen {
     Overview,
     History,
     Prints,
+    Printers,
     Settings,
 }
 
@@ -48,6 +50,8 @@ pub struct BambuApp {
     show_access_code: bool,
     titlebar_should_move: bool,
     prints: PrintHistory,
+    discovery: DiscoveryState,
+    discovery_code_input: Entity<InputState>,
     /// Model for the job the printer reports, shown in the Overview twin.
     job_model: Option<Arc<ModelMesh>>,
     /// Job name the current `job_model` request was made for.
@@ -56,6 +60,19 @@ pub struct BambuApp {
     _poll: Task<()>,
     _poll_ftps: Task<()>,
     _poll_video: Task<()>,
+}
+
+/// State behind the Printers (discovery) screen.
+#[derive(Default)]
+struct DiscoveryState {
+    printers: Vec<DiscoveredPrinter>,
+    scanning: bool,
+    /// Whether any search has finished, so the screen searches once on open.
+    scanned: bool,
+    error: Option<String>,
+    /// Serial of the printer whose access-code prompt is open.
+    selected: Option<String>,
+    results: Option<std::sync::mpsc::Receiver<anyhow::Result<Vec<DiscoveredPrinter>>>>,
 }
 
 /// State behind the Print History tab.
@@ -123,7 +140,22 @@ impl BambuApp {
             input.set_editor_style(input_style(theme));
             input
         });
+        let discovery_code_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("8-digit code");
+            input.set_editor_style(input_style(theme));
+            input
+        });
         let subscriptions = vec![
+            cx.subscribe_in(
+                &discovery_code_input,
+                window,
+                |app, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        app.connect_discovered(window, cx);
+                    }
+                    cx.notify();
+                },
+            ),
             cx.subscribe_in(&host_input, window, |_, _, _: &InputEvent, _, cx| {
                 cx.notify();
             }),
@@ -145,7 +177,7 @@ impl BambuApp {
                     .await;
                 if this
                     .update(cx, |app, cx| {
-                        if app.drain_network() {
+                        if app.drain_network() | app.drain_discovery() {
                             cx.notify();
                         }
                     })
@@ -161,7 +193,7 @@ impl BambuApp {
             screen: if has_config {
                 Screen::Overview
             } else {
-                Screen::Settings
+                Screen::Printers
             },
             connection: ConnectionState::Disconnected,
             ever_connected: false,
@@ -178,6 +210,8 @@ impl BambuApp {
             show_access_code: false,
             titlebar_should_move: false,
             prints: PrintHistory::default(),
+            discovery: DiscoveryState::default(),
+            discovery_code_input,
             job_model: None,
             job_model_name: String::new(),
             _subscriptions: subscriptions,
@@ -429,15 +463,338 @@ impl BambuApp {
     }
 
     fn draft_config(&self, cx: &App) -> PrinterConfig {
+        let host = self.host_input.read(cx).value().to_string();
+        // Keep the discovered identity while the address is unchanged.
+        let identity = if host.trim() == self.config.host {
+            self.config.clone()
+        } else {
+            PrinterConfig::default()
+        };
         PrinterConfig {
-            host: self.host_input.read(cx).value().to_string(),
+            host,
             access_code: self.code_input.read(cx).value().to_string(),
+            ..identity
         }
     }
 
+    fn start_discovery(&mut self) {
+        if self.discovery.scanning {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("bambux-discovery".into())
+            .spawn(move || {
+                let _ = sender.send(crate::discovery::discover(Duration::from_secs(3)));
+            })
+            .expect("spawn discovery thread");
+        self.discovery.scanning = true;
+        self.discovery.error = None;
+        self.discovery.results = Some(receiver);
+    }
+
+    fn drain_discovery(&mut self) -> bool {
+        let Some(receiver) = &self.discovery.results else {
+            return false;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return false;
+        };
+        let discovery = &mut self.discovery;
+        discovery.results = None;
+        discovery.scanning = false;
+        discovery.scanned = true;
+        match result {
+            Ok(printers) => discovery.printers = printers,
+            Err(error) => discovery.error = Some(format!("Discovery failed: {error:#}")),
+        }
+        if let Some(selected) = &discovery.selected
+            && !discovery.printers.iter().any(|p| &p.serial == selected)
+        {
+            discovery.selected = None;
+        }
+        true
+    }
+
+    fn select_discovered(&mut self, serial: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.discovery.selected = Some(serial);
+        self.discovery_code_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn connect_discovered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(printer) = self
+            .discovery
+            .selected
+            .as_ref()
+            .and_then(|serial| self.discovery.printers.iter().find(|p| &p.serial == serial))
+            .cloned()
+        else {
+            return;
+        };
+        let code = self.discovery_code_input.read(cx).value().trim().to_owned();
+        if code.is_empty() {
+            return;
+        }
+        let config = PrinterConfig {
+            host: printer.host,
+            access_code: code,
+            name: printer.name,
+            model: printer.model_code,
+            serial: printer.serial,
+        };
+        // Keep the manual Configuration form in step with what was saved.
+        let (host, code) = (config.host.clone(), config.access_code.clone());
+        self.host_input
+            .update(cx, |input, cx| input.set_value(host, window, cx));
+        self.code_input
+            .update(cx, |input, cx| input.set_value(code, window, cx));
+        self.discovery.selected = None;
+        self.discovery_code_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.apply_config(config, cx);
+    }
+
+    fn render_printers(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        if !self.discovery.scanned && !self.discovery.scanning {
+            self.start_discovery();
+        }
+        let discovery = &self.discovery;
+        let status: Option<(Hsla, String)> = if let Some(error) = &discovery.error {
+            Some((theme.warning, error.clone()))
+        } else if discovery.scanning {
+            Some((theme.text_muted, "Searching your network…".into()))
+        } else if discovery.printers.is_empty() {
+            Some((
+                theme.text_muted,
+                "No printers answered. Check that the printer is on and on the same network as this computer."
+                    .into(),
+            ))
+        } else {
+            None
+        };
+
+        let mut list = div().flex().flex_col().gap(px(6.0));
+        for printer in &discovery.printers {
+            let selected = discovery.selected.as_deref() == Some(printer.serial.as_str());
+            let current = self.config.host == printer.host
+                || (!self.config.serial.is_empty() && self.config.serial == printer.serial);
+            let serial = printer.serial.clone();
+            let row = div()
+                .id(SharedString::from(format!("discovered-{}", printer.serial)))
+                .p(px(12.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if selected { theme.accent } else { theme.border })
+                .when(selected, |row| row.bg(theme.active))
+                .when(!selected, |row| {
+                    row.hover(move |style| style.bg(theme.hover))
+                })
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(printer.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(printer.model_name().to_owned()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_family("Geist Mono")
+                                .text_size(px(10.0))
+                                .text_color(theme.text_faint)
+                                .child(
+                                    [
+                                        Some(printer.host.clone()),
+                                        printer.firmware.as_ref().map(|v| format!("FW {v}")),
+                                        printer.connection.as_ref().map(|mode| {
+                                            if mode == "lan" {
+                                                "LAN-ONLY".to_owned()
+                                            } else {
+                                                mode.to_ascii_uppercase()
+                                            }
+                                        }),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    .collect::<Vec<_>>()
+                                    .join("  ·  "),
+                                ),
+                        ),
+                )
+                .when(current, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .font_family("Geist Mono")
+                            .text_size(px(9.0))
+                            .text_color(connection_color(self.connection, theme))
+                            .child(if self.connection == ConnectionState::Online {
+                                "CONNECTED"
+                            } else {
+                                "CONFIGURED"
+                            }),
+                    )
+                })
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.select_discovered(serial.clone(), window, cx);
+                }));
+            list = list.child(row);
+            if selected {
+                list = list.child(self.access_code_prompt(theme, printer, cx));
+            }
+        }
+
+        page_shell(
+            theme,
+            "Printers",
+            "Find Bambu printers on your network and connect",
+        )
+        .max_w(px(780.0))
+        .child(
+            div()
+                .mt(px(16.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .font_family("Geist Mono")
+                        .text_size(px(10.5))
+                        .text_color(theme.text_muted)
+                        .child(format!("{} FOUND", discovery.printers.len())),
+                )
+                .child(div().flex_1())
+                .child(
+                    theme::action(theme, false)
+                        .id("discovery-manual")
+                        .h(px(28.0))
+                        .text_size(px(11.0))
+                        .child("Enter manually")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.screen = Screen::Settings;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    theme::action(theme, true)
+                        .id("discovery-scan")
+                        .h(px(28.0))
+                        .text_size(px(11.0))
+                        .opacity(if discovery.scanning { 0.5 } else { 1.0 })
+                        .child(if discovery.scanning {
+                            "Searching…"
+                        } else {
+                            "Search again"
+                        })
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.start_discovery();
+                            cx.notify();
+                        })),
+                ),
+        )
+        .when_some(status, |page, (color, message)| {
+            page.child(
+                div()
+                    .mt(px(10.0))
+                    .text_size(px(11.5))
+                    .text_color(color)
+                    .child(message),
+            )
+        })
+        .child(theme::card(theme).mt(px(12.0)).p(px(8.0)).child(list))
+        .into_any_element()
+    }
+
+    fn access_code_prompt(
+        &self,
+        theme: Theme,
+        printer: &crate::discovery::DiscoveredPrinter,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ready = !self.discovery_code_input.read(cx).value().trim().is_empty();
+        div()
+            .mb(px(6.0))
+            .p(px(14.0))
+            .rounded(px(8.0))
+            .bg(theme.hover)
+            .border_1()
+            .border_color(theme.border)
+            .child(form_label(theme, "LAN ACCESS CODE"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(input_shell(theme, &self.discovery_code_input).flex_1())
+                    .child(
+                        theme::action(theme, true)
+                            .id("discovery-connect")
+                            .opacity(if ready { 1.0 } else { 0.42 })
+                            .child("Connect")
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.connect_discovered(window, cx);
+                            })),
+                    )
+                    .child(
+                        theme::action(theme, false)
+                            .id("discovery-cancel")
+                            .child("Cancel")
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.discovery.selected = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint)
+                    .child(format!(
+                        "Shown on {} under Settings → Network → LAN Only Mode.",
+                        printer.name
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn save_and_connect(&mut self, cx: &mut Context<Self>) {
-        let mut config = self.draft_config(cx);
+        let config = self.draft_config(cx);
+        self.apply_config(config, cx);
+    }
+
+    /// Save `config` as the configured printer and connect to it.
+    fn apply_config(&mut self, mut config: PrinterConfig, cx: &mut Context<Self>) {
         config.host = config.normalized_host();
+        if config.host != self.config.host {
+            // A different printer: drop the previous one's live state.
+            self.status = PrinterStatus::default();
+            self.history = SessionHistory::default();
+        }
         self.config = config.clone();
         self.error = None;
         // New printer credentials: rescan print history on next view.
@@ -472,12 +829,18 @@ impl BambuApp {
 
     fn render_titlebar(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
         let status_color = connection_color(self.connection, theme);
-        let serial: SharedString = self
-            .status
-            .serial
-            .clone()
-            .unwrap_or_else(|| "LOCAL PRINTER".into())
-            .into();
+        let printer_label: SharedString = if !self.config.name.is_empty() {
+            match crate::discovery::model_name(&self.config.model) {
+                "" => self.config.name.clone(),
+                model => format!("{} · {model}", self.config.name),
+            }
+        } else {
+            self.status
+                .serial
+                .clone()
+                .unwrap_or_else(|| "LOCAL PRINTER".into())
+        }
+        .into();
         let updated = self.status.last_update.map(|update| {
             format!(
                 "UPDATED {}",
@@ -541,10 +904,22 @@ impl BambuApp {
             )
             .child(
                 div()
+                    .id("titlebar-printer")
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(5.0))
                     .font_family("Geist Mono")
                     .text_size(px(10.0))
                     .text_color(theme.text_muted)
-                    .child(serial),
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                    // Don't start a window drag from the printer switcher.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.screen = Screen::Printers;
+                        cx.notify();
+                    }))
+                    .child(format!("{printer_label}  ▾")),
             )
             .child(div().flex_1())
             .when_some(updated, |row, updated| {
@@ -591,6 +966,7 @@ impl BambuApp {
             .child(self.nav_item(theme, Screen::Prints, "▣", "Print History", cx))
             .child(self.nav_item(theme, Screen::History, "⌁", "Telemetry", cx))
             .child(sidebar_label(theme, "DEVICE").mt(px(20.0)))
+            .child(self.nav_item(theme, Screen::Printers, "⌕", "Printers", cx))
             .child(self.nav_item(theme, Screen::Settings, "⚙", "Configuration", cx))
             .child(div().flex_1())
             .child(
@@ -622,6 +998,7 @@ impl BambuApp {
                 Screen::Overview => "nav-overview",
                 Screen::History => "nav-history",
                 Screen::Prints => "nav-prints",
+                Screen::Printers => "nav-printers",
                 Screen::Settings => "nav-settings",
             })
             .h(px(36.0))
@@ -1706,8 +2083,34 @@ impl BambuApp {
         )
         .max_w(px(780.0))
         .child(
+            div()
+                .mt(px(16.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .child("Printer on this network? Find it instead of typing its address."),
+                )
+                .child(div().flex_1())
+                .child(
+                    theme::action(theme, false)
+                        .id("settings-discover")
+                        .h(px(28.0))
+                        .text_size(px(11.0))
+                        .child("Find printers")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.screen = Screen::Printers;
+                            app.start_discovery();
+                            cx.notify();
+                        })),
+                ),
+        )
+        .child(
             theme::card(theme)
-                .mt(px(20.0))
+                .mt(px(12.0))
                 .p(px(18.0))
                 .child(section_title(theme, "Connection", "Enter the printer's local address and LAN-only access code."))
                 .child(form_label(theme, "PRINTER IP OR HOSTNAME").mt(px(20.0)))
@@ -1842,6 +2245,7 @@ impl Render for BambuApp {
             Screen::Overview => self.render_overview(theme, cx),
             Screen::History => self.render_history(theme, cx),
             Screen::Prints => self.render_prints(theme, cx),
+            Screen::Printers => self.render_printers(theme, cx),
             Screen::Settings => self.render_settings(theme, cx),
         };
 

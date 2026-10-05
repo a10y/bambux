@@ -1,5 +1,6 @@
 mod ams;
 mod app;
+mod discovery;
 mod ftps;
 mod model;
 mod model_3mf;

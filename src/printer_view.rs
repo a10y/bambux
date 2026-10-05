@@ -67,6 +67,8 @@ struct Scene {
     yaw: f32,
     pitch: f32,
     scale: f32,
+    /// Foreshortening per world unit of depth; 0 is orthographic.
+    perspective: f32,
 }
 
 impl Scene {
@@ -79,6 +81,19 @@ impl Scene {
             yaw,
             pitch,
             scale: f32::from(bounds.size.width.min(bounds.size.height)) * 0.35,
+            perspective: 0.16,
+        }
+    }
+
+    /// Orthographic camera centred on the bounds, for inspecting a model
+    /// without keystone distortion. One world unit is half the short side.
+    fn orthographic(bounds: Bounds<Pixels>, yaw: f32, pitch: f32) -> Self {
+        Self {
+            center: bounds.center(),
+            yaw,
+            pitch,
+            scale: f32::from(bounds.size.width.min(bounds.size.height)) * 0.5,
+            perspective: 0.0,
         }
     }
 
@@ -96,7 +111,7 @@ impl Scene {
 
     fn project(&self, p: V3) -> Point<Pixels> {
         let c = self.camera(p);
-        let perspective = 1.0 / (1.0 + c.z * 0.16);
+        let perspective = 1.0 / (1.0 + c.z * self.perspective);
         point(
             self.center.x + px(c.x * self.scale * perspective),
             self.center.y - px(c.y * self.scale * perspective),
@@ -451,39 +466,41 @@ pub fn model_view(model: Arc<ModelMesh>, yaw: f32, pitch: f32, theme: Theme) -> 
         |_, _, _| (),
         move |bounds, _, window, _| {
             window.paint_quad(gpui::fill(bounds, crate::theme::color(0x070708)));
-            let scene = Scene::new(bounds, yaw, pitch);
+            let scene = Scene::orthographic(bounds, yaw, pitch);
             paint_preview(window, &scene, &model, theme);
         },
     )
     .size_full()
 }
 
-/// World units the model's largest dimension is fitted to.
-const PREVIEW_EXTENT: f32 = 1.6;
-const PREVIEW_FLOOR: f32 = -0.8;
+/// World units the model's bounding-box diagonal is fitted to. An
+/// orthographic view of a box never spans more than its diagonal, so the
+/// part stays in frame at every orbit angle.
+const PREVIEW_DIAGONAL: f32 = 1.85;
 const SHADE_LEVELS: f32 = 24.0;
 
 fn paint_preview(window: &mut gpui::Window, scene: &Scene, mesh: &ModelMesh, theme: Theme) {
     let [min_x, min_y, min_z] = mesh.min;
     let [max_x, max_y, max_z] = mesh.max;
-    let span = (max_x - min_x)
-        .max(max_y - min_y)
-        .max(max_z - min_z)
+    let diagonal = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2) + (max_z - min_z).powi(2))
+        .sqrt()
         .max(1e-3);
-    let scale = PREVIEW_EXTENT / span;
+    let scale = PREVIEW_DIAGONAL / diagonal;
     let (cx, cy) = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
+    // Centre the bounding box on the orbit pivot, so the part sits mid-frame.
+    let floor = -(max_z - min_z) * scale / 2.0;
     // Printer space is Z-up and right-handed; the scene is Y-up. Map
     // (x, y, z) -> (x, z, -y), a proper rotation, so face winding survives.
     let to_world = |p: [f32; 3]| V3 {
         x: (p[0] - cx) * scale,
-        y: PREVIEW_FLOOR + (p[2] - min_z) * scale,
+        y: floor + (p[2] - min_z) * scale,
         z: -(p[1] - cy) * scale,
     };
 
     // Build plate under the part's footprint.
     let half_x = (max_x - min_x) * scale / 2.0 + 0.12;
     let half_z = (max_y - min_y) * scale / 2.0 + 0.12;
-    let plate_y = PREVIEW_FLOOR - 0.01;
+    let plate_y = floor - 0.01;
     polygon(
         window,
         scene,
