@@ -9,6 +9,7 @@ use gpui::{
 use gpui_base::input::{DiagnosticColors, Input, InputEditorStyle, InputEvent, InputState};
 
 use crate::{
+    ams::{ActiveSpool, AmsState, Spool},
     model::{
         ConnectionState, HistoryEntry, PrinterConfig, PrinterStatus, ServiceHealth, ServiceState,
         SessionHistory, TelemetryPoint,
@@ -701,7 +702,10 @@ impl BambuApp {
                         .flex_col()
                         .gap(px(12.0))
                         .child(self.digital_twin(theme, cx))
-                        .child(self.metrics(theme)),
+                        .child(self.metrics(theme))
+                        .when(!self.status.ams.is_empty(), |column| {
+                            column.child(self.ams_overview(theme))
+                        }),
                 )
                 .child(self.timeline_card(theme, 300.0)),
         )
@@ -846,6 +850,196 @@ impl BambuApp {
             .into_any_element()
     }
 
+    /// Overview card: one tile per AMS slot plus the external spool.
+    fn ams_overview(&self, theme: Theme) -> AnyElement {
+        let ams = &self.status.ams;
+        let mut card = theme::card(theme).p(px(16.0));
+        for unit in &ams.units {
+            let tiles = unit.slots.iter().enumerate().map(|(slot, spool)| {
+                let active = ams.active
+                    == Some(ActiveSpool::Slot {
+                        unit: unit.id,
+                        slot: slot as u32,
+                    });
+                spool_tile(theme, slot_label(unit.id, slot as u32), spool, active)
+            });
+            card = card.child(
+                div()
+                    .when(unit.id > 0, |section| section.mt(px(14.0)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(theme::eyebrow(
+                                theme,
+                                if ams.units.len() > 1 {
+                                    ["AMS A", "AMS B", "AMS C", "AMS D"]
+                                        .get(unit.id as usize)
+                                        .copied()
+                                        .unwrap_or("AMS")
+                                } else {
+                                    "AMS"
+                                },
+                            ))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .font_family("Geist Mono")
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .child(ams_environment_label(unit)),
+                            ),
+                    )
+                    .child(div().mt(px(10.0)).flex().gap(px(8.0)).children(tiles)),
+            );
+        }
+        if let Some(spool) = &ams.external {
+            let active = ams.active == Some(ActiveSpool::External);
+            card = card.child(
+                div()
+                    .mt(px(14.0))
+                    .child(theme::eyebrow(theme, "EXTERNAL SPOOL"))
+                    .child(
+                        div()
+                            .mt(px(10.0))
+                            .flex()
+                            .gap(px(8.0))
+                            .child(spool_tile(theme, "EXT".into(), spool, active))
+                            .children((0..3).map(|_| div().flex_1())),
+                    ),
+            );
+        }
+        card.into_any_element()
+    }
+
+    /// Telemetry card: remaining filament per spool and what this session used.
+    fn filament_usage(&self, theme: Theme) -> AnyElement {
+        let ams = &self.status.ams;
+        let mut rows = div().mt(px(8.0)).flex().flex_col();
+        let mut spools: Vec<(String, u32, u32, &Spool, bool)> = Vec::new();
+        for unit in &ams.units {
+            for (slot, spool) in unit.slots.iter().enumerate() {
+                let active = ams.active
+                    == Some(ActiveSpool::Slot {
+                        unit: unit.id,
+                        slot: slot as u32,
+                    });
+                spools.push((
+                    slot_label(unit.id, slot as u32),
+                    unit.id,
+                    slot as u32,
+                    spool,
+                    active,
+                ));
+            }
+        }
+        if let Some(spool) = &ams.external {
+            spools.push((
+                "EXT".into(),
+                u32::MAX,
+                0,
+                spool,
+                ams.active == Some(ActiveSpool::External),
+            ));
+        }
+
+        for (label, unit, slot, spool, active) in spools {
+            let used = self.history.spool_used(unit, slot, spool);
+            let (title, detail) = if spool.loaded {
+                let title = if spool.name.is_empty() {
+                    spool.kind.clone()
+                } else {
+                    spool.name.clone()
+                };
+                let detail = match (spool.remain, used) {
+                    (Some(_), Some(used)) if used > 0 => format!("−{used}% this session"),
+                    (Some(_), _) => "No change this session".into(),
+                    (None, _) => "Remaining not tracked (no RFID tag)".into(),
+                };
+                (title, detail)
+            } else {
+                ("Empty".into(), String::new())
+            };
+            rows = rows.child(
+                div()
+                    .py(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .flex_none()
+                            .font_family("Geist Mono")
+                            .text_size(px(10.0))
+                            .text_color(if active {
+                                theme.accent
+                            } else {
+                                theme.text_faint
+                            })
+                            .child(label),
+                    )
+                    .child(spool_swatch(theme, spool, 14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(if spool.loaded {
+                                        theme.text
+                                    } else {
+                                        theme.text_faint
+                                    })
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .when(!detail.is_empty(), |column| {
+                                column.child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.text_faint)
+                                        .truncate()
+                                        .child(detail),
+                                )
+                            }),
+                    )
+                    .when(spool.loaded, |row| {
+                        row.child(
+                            div()
+                                .w(px(84.0))
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .items_end()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .font_family("Geist Mono")
+                                        .text_size(px(12.0))
+                                        .child(remain_label(spool.remain)),
+                                )
+                                .child(remain_bar(theme, spool.remain)),
+                        )
+                    }),
+            );
+        }
+
+        theme::card(theme)
+            .w(px(340.0))
+            .flex_none()
+            .p(px(16.0))
+            .child(theme::eyebrow(theme, "FILAMENT"))
+            .child(rows)
+            .into_any_element()
+    }
+
     fn timeline_card(&self, theme: Theme, width: f32) -> AnyElement {
         let mut list = div()
             .id("overview-history-scroll")
@@ -892,6 +1086,12 @@ impl BambuApp {
 
     fn render_history(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
         let points: Vec<_> = self.history.telemetry.iter().cloned().collect();
+        let thermal_series = vec![
+            ChartSeries::new(theme.warning, "Nozzle °C", " °C", 1, |p| p.nozzle),
+            ChartSeries::new(theme.accent, "Bed °C", " °C", 1, |p| p.bed),
+            ChartSeries::new(theme.cyan, "Progress %", "%", 0, |p| Some(p.progress)),
+        ];
+        let ams_series = ams_chart_series(&self.status.ams, theme);
         let mut events = div().mt(px(10.0)).flex().flex_col();
         if self.history.events.is_empty() {
             events = events.child(empty_history(theme));
@@ -925,18 +1125,60 @@ impl BambuApp {
                         // position, so repaint as the pointer moves or leaves.
                         .on_mouse_move(cx.listener(|_, _, _, cx| cx.notify()))
                         .on_hover(cx.listener(|_, _, _, cx| cx.notify()))
-                        .child(telemetry_chart(points, theme)),
+                        .child(telemetry_chart(
+                            points.clone(),
+                            thermal_series.clone(),
+                            280.0,
+                            theme,
+                        )),
                 )
                 .child(
-                    div()
-                        .mt(px(8.0))
-                        .flex()
-                        .gap(px(16.0))
-                        .child(legend(theme.warning, "Nozzle °C"))
-                        .child(legend(theme.accent, "Bed °C"))
-                        .child(legend(theme.cyan, "Progress %")),
+                    div().mt(px(8.0)).flex().gap(px(16.0)).children(
+                        thermal_series
+                            .iter()
+                            .map(|line| legend(line.color, line.label.clone())),
+                    ),
                 ),
         )
+        .when(!self.status.ams.is_empty(), |page| {
+            page.child(
+                div()
+                    .mt(px(12.0))
+                    .flex()
+                    .items_start()
+                    .gap(px(12.0))
+                    .child(
+                        theme::card(theme)
+                            .flex_1()
+                            .min_w_0()
+                            .p(px(16.0))
+                            .child(theme::eyebrow(theme, "AMS ENVIRONMENT"))
+                            .child(
+                                div()
+                                    .id("ams-chart")
+                                    .mt(px(10.0))
+                                    .h(px(190.0))
+                                    .w_full()
+                                    .on_mouse_move(cx.listener(|_, _, _, cx| cx.notify()))
+                                    .on_hover(cx.listener(|_, _, _, cx| cx.notify()))
+                                    .child(telemetry_chart(
+                                        points,
+                                        ams_series.clone(),
+                                        100.0,
+                                        theme,
+                                    )),
+                            )
+                            .child(
+                                div().mt(px(8.0)).flex().flex_wrap().gap(px(16.0)).children(
+                                    ams_series
+                                        .iter()
+                                        .map(|line| legend(line.color, line.label.clone())),
+                                ),
+                            ),
+                    )
+                    .child(self.filament_usage(theme)),
+            )
+        })
         .child(
             theme::card(theme)
                 .mt(px(12.0))
@@ -1812,7 +2054,43 @@ fn orbit_surface(
         )
 }
 
-fn telemetry_chart(points: Vec<TelemetryPoint>, theme: Theme) -> impl IntoElement {
+type SeriesValue = Rc<dyn Fn(&TelemetryPoint) -> Option<f32>>;
+
+/// One line on a telemetry chart.
+#[derive(Clone)]
+struct ChartSeries {
+    color: Hsla,
+    label: SharedString,
+    unit: &'static str,
+    decimals: usize,
+    value: SeriesValue,
+}
+
+impl ChartSeries {
+    fn new(
+        color: Hsla,
+        label: impl Into<SharedString>,
+        unit: &'static str,
+        decimals: usize,
+        value: impl Fn(&TelemetryPoint) -> Option<f32> + 'static,
+    ) -> Self {
+        Self {
+            color,
+            label: label.into(),
+            unit,
+            decimals,
+            value: Rc::new(value),
+        }
+    }
+}
+
+/// Session line chart on a fixed 0..`max` scale, with a hover readout.
+fn telemetry_chart(
+    points: Vec<TelemetryPoint>,
+    series: Vec<ChartSeries>,
+    max: f32,
+    theme: Theme,
+) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| (),
         move |bounds, _, window, cx| {
@@ -1844,19 +2122,15 @@ fn telemetry_chart(points: Vec<TelemetryPoint>, theme: Theme) -> impl IntoElemen
                 bounds.origin.x + bounds.size.width * (elapsed / time_span)
             };
             let y_of = |value: f32| {
-                bounds.origin.y + bounds.size.height * (1.0 - (value / 280.0).clamp(0.0, 1.0))
+                bounds.origin.y + bounds.size.height * (1.0 - (value / max).clamp(0.0, 1.0))
             };
-            type Series = (Hsla, fn(&TelemetryPoint) -> Option<f32>);
-            let series: [Series; 3] = [
-                (theme.warning, |p| p.nozzle),
-                (theme.accent, |p| p.bed),
-                (theme.cyan, |p| Some(p.progress)),
-            ];
-            for (color, value) in series {
+            for line in &series {
                 let mut path = PathBuilder::stroke(px(1.5));
                 let mut started = false;
                 for sample in &points {
-                    let Some(value) = value(sample) else { continue };
+                    let Some(value) = (line.value)(sample) else {
+                        continue;
+                    };
                     let at = point(x_of(sample), y_of(value));
                     if started {
                         path.line_to(at);
@@ -1866,7 +2140,7 @@ fn telemetry_chart(points: Vec<TelemetryPoint>, theme: Theme) -> impl IntoElemen
                     }
                 }
                 if started && let Ok(path) = path.build() {
-                    window.paint_path(path, color);
+                    window.paint_path(path, line.color);
                 }
             }
 
@@ -1897,38 +2171,31 @@ fn telemetry_chart(points: Vec<TelemetryPoint>, theme: Theme) -> impl IntoElemen
                 1.0,
                 theme.text_muted.opacity(0.5),
             );
-            for (color, value) in series {
-                if let Some(value) = value(sample) {
+            for line in &series {
+                if let Some(value) = (line.value)(sample) {
                     let center = point(x, y_of(value));
                     window.paint_quad(
                         gpui::fill(
                             gpui::Bounds::centered_at(center, gpui::size(px(7.0), px(7.0))),
-                            color,
+                            line.color,
                         )
                         .corner_radii(px(3.5)),
                     );
                 }
             }
 
-            let reading = |value: Option<f32>, unit: &str| {
-                value.map_or("—".to_owned(), |value| format!("{value:.1}{unit}"))
-            };
-            let lines = [
-                (
-                    theme.text_muted,
-                    sample
-                        .at
-                        .with_timezone(&chrono::Local)
-                        .format("%H:%M:%S")
-                        .to_string(),
-                ),
-                (theme.cyan, format!("Progress  {:.0}%", sample.progress)),
-                (
-                    theme.warning,
-                    format!("Nozzle  {}", reading(sample.nozzle, " °C")),
-                ),
-                (theme.accent, format!("Bed  {}", reading(sample.bed, " °C"))),
-            ];
+            let time = sample
+                .at
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string();
+            let lines =
+                std::iter::once((theme.text_muted, time)).chain(series.iter().map(|line| {
+                    let reading = (line.value)(sample).map_or("—".to_owned(), |value| {
+                        format!("{value:.*}{}", line.decimals, line.unit)
+                    });
+                    (line.color, format!("{}  {reading}", line.label))
+                }));
             let font_size = px(10.5);
             let line_height = px(15.0);
             let padding = px(8.0);
@@ -1993,7 +2260,7 @@ fn paint_line(
     }
 }
 
-fn legend(color: Hsla, label: &'static str) -> AnyElement {
+fn legend(color: Hsla, label: impl Into<SharedString>) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -2001,7 +2268,7 @@ fn legend(color: Hsla, label: &'static str) -> AnyElement {
         .text_size(px(9.0))
         .text_color(color)
         .child(status_dot(color, 5.0))
-        .child(label)
+        .child(label.into())
         .into_any_element()
 }
 
@@ -2177,6 +2444,207 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Bambu's slot naming: AMS A slots are A1–A4, AMS B slots B1–B4, and so on.
+fn slot_label(unit: u32, slot: u32) -> String {
+    let letter = char::from(b'A' + (unit.min(25) as u8));
+    format!("{letter}{}", slot + 1)
+}
+
+fn ams_environment_label(unit: &crate::ams::AmsUnit) -> String {
+    let humidity = match (unit.humidity, unit.humidity_level) {
+        (Some(percent), _) => format!("{percent:.0}% RH"),
+        (None, Some(level)) => format!("Humidity {level}/5"),
+        (None, None) => "Humidity —".into(),
+    };
+    match unit.temperature {
+        Some(temperature) => format!("{humidity} · {temperature:.1} °C"),
+        None => humidity,
+    }
+}
+
+/// Humidity and temperature lines for each AMS unit, on a shared 0–100 scale.
+fn ams_chart_series(ams: &AmsState, theme: Theme) -> Vec<ChartSeries> {
+    let humidity_colors = [theme.cyan, theme.success];
+    let temperature_colors = [theme.warning, theme.accent];
+    let multiple = ams.units.len() > 1;
+    ams.units
+        .iter()
+        .enumerate()
+        .flat_map(|(index, unit)| {
+            let id = unit.id;
+            let prefix = if multiple {
+                format!("AMS {} ", char::from(b'A' + (id.min(25) as u8)))
+            } else {
+                String::new()
+            };
+            let reading =
+                move |p: &TelemetryPoint| p.ams.iter().find(|env| env.unit == id).copied();
+            [
+                ChartSeries::new(
+                    humidity_colors[index % 2],
+                    format!("{prefix}Humidity %"),
+                    "%",
+                    0,
+                    move |p| reading(p)?.humidity,
+                ),
+                ChartSeries::new(
+                    temperature_colors[index % 2],
+                    format!("{prefix}Temperature °C"),
+                    " °C",
+                    1,
+                    move |p| reading(p)?.temperature,
+                ),
+            ]
+        })
+        .collect()
+}
+
+fn spool_swatch(theme: Theme, spool: &Spool, size: f32) -> gpui::Div {
+    let fill = match (spool.loaded, spool.color) {
+        (true, Some(rgb)) => theme::color(rgb),
+        (true, None) => theme.text_faint,
+        (false, _) => theme.hover,
+    };
+    div()
+        .size(px(size))
+        .flex_none()
+        .rounded_full()
+        .bg(fill)
+        .border_1()
+        .border_color(theme.border_strong)
+}
+
+fn remain_label(remain: Option<u8>) -> String {
+    remain.map_or("—".into(), |remain| format!("{remain}%"))
+}
+
+fn remain_bar(theme: Theme, remain: Option<u8>) -> gpui::Div {
+    let fraction = remain.map_or(0.0, |remain| f32::from(remain) / 100.0);
+    let color = match remain {
+        Some(remain) if remain <= 15 => theme.warning,
+        _ => theme.accent,
+    };
+    div()
+        .w_full()
+        .h(px(4.0))
+        .rounded(px(2.0))
+        .bg(theme.border_strong)
+        .child(
+            div()
+                .h_full()
+                .w(gpui::relative(fraction))
+                .rounded(px(2.0))
+                .bg(color),
+        )
+}
+
+/// Overview tile for one AMS slot or the external spool.
+fn spool_tile(theme: Theme, label: String, spool: &Spool, active: bool) -> AnyElement {
+    let (title, subtitle) = if spool.loaded {
+        (
+            spool.kind.clone(),
+            if spool.name.is_empty() || spool.name == spool.kind {
+                if spool.bambu {
+                    "Bambu".into()
+                } else {
+                    "Generic".into()
+                }
+            } else {
+                spool.name.clone()
+            },
+        )
+    } else {
+        ("Empty".to_owned(), String::new())
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .p(px(10.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if active { theme.accent } else { theme.border })
+        .when(active, |tile| tile.bg(theme.active))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .font_family("Geist Mono")
+                        .text_size(px(9.5))
+                        .text_color(if active {
+                            theme.accent
+                        } else {
+                            theme.text_faint
+                        })
+                        .child(label),
+                )
+                .child(div().flex_1())
+                .when(active, |row| {
+                    row.child(
+                        div()
+                            .font_family("Geist Mono")
+                            .text_size(px(8.5))
+                            .text_color(theme.accent)
+                            .child("FEEDING"),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(spool_swatch(theme, spool, 22.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(if spool.loaded {
+                                    theme.text
+                                } else {
+                                    theme.text_faint
+                                })
+                                .truncate()
+                                .child(title),
+                        )
+                        .when(!subtitle.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(theme.text_faint)
+                                    .truncate()
+                                    .child(subtitle),
+                            )
+                        }),
+                ),
+        )
+        .when(spool.loaded, |tile| {
+            tile.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .font_family("Geist Mono")
+                            .text_size(px(15.0))
+                            .child(remain_label(spool.remain)),
+                    )
+                    .child(remain_bar(theme, spool.remain)),
+            )
+        })
+        .into_any_element()
 }
 
 fn fact_chip(theme: Theme, label: String, swatch: Option<Hsla>) -> AnyElement {

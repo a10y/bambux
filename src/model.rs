@@ -1,8 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::ams::AmsState;
 
 pub const HISTORY_LIMIT: usize = 500;
 pub const TELEMETRY_LIMIT: usize = 240;
@@ -105,6 +107,7 @@ pub struct PrinterStatus {
     pub speed_level: Option<u32>,
     pub wifi_signal: Option<String>,
     pub last_update: Option<DateTime<Utc>>,
+    pub ams: AmsState,
     pub raw: Value,
 }
 
@@ -146,6 +149,7 @@ impl PrinterStatus {
         let old_layer = self.current_layer;
         let old_job = self.job_name.clone();
 
+        self.ams.apply(report.get("print").unwrap_or(&report));
         if self.raw.is_null() {
             self.raw = Value::Object(Default::default());
         }
@@ -227,12 +231,22 @@ pub struct TelemetryPoint {
     pub nozzle: Option<f32>,
     pub bed: Option<f32>,
     pub progress: f32,
+    pub ams: Vec<AmsEnvironment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AmsEnvironment {
+    pub unit: u32,
+    pub humidity: Option<f32>,
+    pub temperature: Option<f32>,
 }
 
 #[derive(Default)]
 pub struct SessionHistory {
     pub events: VecDeque<HistoryEntry>,
     pub telemetry: VecDeque<TelemetryPoint>,
+    /// Each spool's remaining percent when first seen this session.
+    spool_baseline: HashMap<String, u8>,
 }
 
 impl SessionHistory {
@@ -247,11 +261,46 @@ impl SessionHistory {
             nozzle: status.nozzle_temp,
             bed: status.bed_temp,
             progress: status.progress,
+            ams: status
+                .ams
+                .units
+                .iter()
+                .map(|unit| AmsEnvironment {
+                    unit: unit.id,
+                    humidity: unit.humidity,
+                    temperature: unit.temperature,
+                })
+                .collect(),
         });
+        for unit in &status.ams.units {
+            for (slot, spool) in unit.slots.iter().enumerate() {
+                if let (true, Some(remain)) = (spool.loaded, spool.remain) {
+                    self.spool_baseline
+                        .entry(spool_key(unit.id, slot as u32, spool))
+                        .or_insert(remain);
+                }
+            }
+        }
         while self.telemetry.len() > TELEMETRY_LIMIT {
             self.telemetry.pop_front();
         }
     }
+}
+
+impl SessionHistory {
+    /// Percentage points of a spool used since it was first seen this session.
+    pub fn spool_used(&self, unit: u32, slot: u32, spool: &crate::ams::Spool) -> Option<u8> {
+        let start = *self.spool_baseline.get(&spool_key(unit, slot, spool))?;
+        Some(start.saturating_sub(spool.remain?))
+    }
+}
+
+/// Track a spool by its RFID identity so swapping spools resets the baseline.
+fn spool_key(unit: u32, slot: u32, spool: &crate::ams::Spool) -> String {
+    spool
+        .uuid
+        .clone()
+        .unwrap_or_else(|| format!("{unit}-{slot}-{}-{:?}", spool.kind, spool.color))
 }
 
 fn merge_json(target: &mut Value, update: Value) {
